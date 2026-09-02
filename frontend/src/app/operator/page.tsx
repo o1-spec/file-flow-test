@@ -287,59 +287,34 @@ export default function OperatorPage() {
       const cleanup = subscribeWorkspaceEvents(
         workspaceId,
         (data: Record<string, unknown>) => {
-          if (data.type === "init") {
-            const rawNodes = (data.nodes as Array<{ id: string; label?: string; state: string; error?: string }>) || [];
+          const snap = (data.snapshot as Record<string, unknown>) || data;
+          const rawNodes = (snap?.nodes as Array<{ id: string; label?: string; state: string; error?: string }>) || [];
+          const snapState = (snap?.state as string) || (data.status as string) || (data.finalState as string) || "";
+
+          if (rawNodes.length > 0) {
             setActiveTx((prev) => {
               if (!prev) return null;
               return {
                 ...prev,
-                status: (data.status as string) || prev.status,
+                status: snapState || prev.status,
                 nodes: rawNodes.map((n) => ({
                   id: n.id,
                   fileflowLabel: getFileFlowLabel(n.id, n.label || n.id),
                   state: n.state as NodeState["state"],
                   error: n.error || null,
                 })),
+                isAwaitingApproval: snapState === "AWAITING_COMPENSATION_APPROVAL",
+                compensationDone: snapState === "COMPENSATED",
               };
             });
-          } else if (data.type === "node_update") {
-            const node = data.node as { id: string; label?: string; state: string; error?: string };
-            if (!node) return;
-            setActiveTx((prev) => {
-              if (!prev) return null;
-              const exists = prev.nodes.some((n) => n.id === node.id);
-              const updatedNodes: NodeState[] = exists
-                ? prev.nodes.map((n) =>
-                    n.id === node.id
-                      ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
-                      : n
-                  )
-                : [
-                    ...prev.nodes,
-                    {
-                      id: node.id,
-                      fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
-                      state: node.state as NodeState["state"],
-                      error: node.error || null,
-                    },
-                  ];
+          }
 
-              return {
-                ...prev,
-                status: (data.overallState as string) || prev.status,
-                nodes: updatedNodes,
-              };
-            });
-          } else if (data.type === "awaiting_approval") {
-            setActiveTx((prev) => (prev ? { ...prev, isAwaitingApproval: true } : null));
+          if (snapState === "AWAITING_COMPENSATION_APPROVAL") {
             pushActivity(
               "DECIDED",
               "MCPx reported downstream failure during workspace provisioning. Saga rollback is awaiting operator authorization."
             );
-          } else if (data.type === "compensated") {
-            setActiveTx((prev) =>
-              prev ? { ...prev, isAwaitingApproval: false, compensationDone: true, status: "COMPENSATED" } : null
-            );
+          } else if (snapState === "COMPENSATED") {
             pushActivity(
               "VERIFIED",
               "Saga reverse compensation completed cleanly. All provisioned reference resources verified absent."
@@ -457,7 +432,7 @@ export default function OperatorPage() {
         </div>
 
         {/* Goal Statement Banner */}
-        <div className="px-4 py-3 rounded-lg bg-white/[0.03] border border-white/10 flex items-start gap-3 text-xs text-zinc-300">
+        <div className="px-4 py-3 rounded-lg bg-white/3 border border-white/10 flex items-start gap-3 text-xs text-zinc-300">
           <span className="text-xs font-semibold text-white uppercase tracking-wider bg-white/10 px-2 py-0.5 rounded shrink-0">
             Goal
           </span>
@@ -558,17 +533,16 @@ export default function OperatorPage() {
                     <div key={act.id} className="text-xs border-l-2 pl-3 py-1 border-zinc-800">
                       <div className="flex items-center gap-2 mb-0.5">
                         <span
-                          className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${
-                            act.type === "OBSERVED"
+                          className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${act.type === "OBSERVED"
                               ? "bg-zinc-800 text-zinc-300"
                               : act.type === "DECIDED"
-                              ? "bg-zinc-800 text-zinc-200 border border-zinc-700"
-                              : act.type === "ACTED"
-                              ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
-                              : act.type === "VERIFIED"
-                              ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
-                              : "bg-rose-500/10 text-rose-400"
-                          }`}
+                                ? "bg-zinc-800 text-zinc-200 border border-zinc-700"
+                                : act.type === "ACTED"
+                                  ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                                  : act.type === "VERIFIED"
+                                    ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                                    : "bg-rose-500/10 text-rose-400"
+                            }`}
                         >
                           {act.type}
                         </span>
@@ -596,15 +570,14 @@ export default function OperatorPage() {
                 </h2>
                 {decision && (
                   <span
-                    className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${
-                      decision.status === "AUTONOMOUS_ACTION"
+                    className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${decision.status === "AUTONOMOUS_ACTION"
                         ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
                         : decision.status === "APPROVAL_REQUIRED"
-                        ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
-                        : decision.status === "BLOCKED"
-                        ? "bg-rose-500/10 border-rose-500/20 text-rose-400"
-                        : "bg-zinc-800 border-zinc-700 text-zinc-300"
-                    }`}
+                          ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
+                          : decision.status === "BLOCKED"
+                            ? "bg-rose-500/10 border-rose-500/20 text-rose-400"
+                            : "bg-zinc-800 border-zinc-700 text-zinc-300"
+                      }`}
                   >
                     {decision.status}
                   </span>
@@ -722,19 +695,18 @@ export default function OperatorPage() {
                           <span className="text-[10px] text-zinc-500 font-mono">({node.id})</span>
                         </div>
                         <span
-                          className={`text-[11px] font-medium px-2 py-0.5 rounded border ${
-                            node.state === "SUCCEEDED"
+                          className={`text-[11px] font-medium px-2 py-0.5 rounded border ${node.state === "SUCCEEDED"
                               ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
                               : node.state === "RECOVERED"
-                              ? "bg-teal-500/10 text-teal-400 border-teal-500/20"
-                              : node.state === "IN_DOUBT"
-                              ? "bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse"
-                              : node.state === "FAILED"
-                              ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
-                              : node.state === "COMPENSATED"
-                              ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
-                              : "bg-zinc-800 text-zinc-400 border-zinc-700"
-                          }`}
+                                ? "bg-teal-500/10 text-teal-400 border-teal-500/20"
+                                : node.state === "IN_DOUBT"
+                                  ? "bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse"
+                                  : node.state === "FAILED"
+                                    ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                                    : node.state === "COMPENSATED"
+                                      ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
+                                      : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                            }`}
                         >
                           {node.state}
                         </span>
