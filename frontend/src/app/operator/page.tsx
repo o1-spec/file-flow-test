@@ -92,6 +92,7 @@ export default function OperatorPage() {
   const [activeTx, setActiveTx] = useState<ActiveTransaction | null>(null);
   const [approving, setApproving] = useState(false);
   const [runnerOffline, setRunnerOffline] = useState(false);
+  const [runnerWaiting, setRunnerWaiting] = useState(false);
   const [agentProvider, setAgentProvider] = useState<string>("Gemini");
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -246,6 +247,13 @@ export default function OperatorPage() {
       eventSourceCleanupRef.current();
     }
 
+    // Prefer the SDK-returned consoleUrl. Fall back to NEXT_PUBLIC_MCPX_CONSOLE_URL so the
+    // production link resolves correctly without hardcoding localhost in deployed builds.
+    const mcpxConsoleUrl =
+      process.env.NEXT_PUBLIC_MCPX_CONSOLE_URL || "http://localhost:3000";
+    const resolvedConsoleUrl =
+      consoleUrl || `${mcpxConsoleUrl}/app/transactions/${transactionId}`;
+
     const initialNodes: NodeState[] = [
       { id: "database", fileflowLabel: "Workspace Database", state: "WAITING" },
       { id: "compute", fileflowLabel: "Processing Runtime", state: "WAITING" },
@@ -257,12 +265,21 @@ export default function OperatorPage() {
       workspaceId,
       workspaceName,
       transactionId,
-      consoleUrl: consoleUrl || `http://localhost:3000/app/transactions/${transactionId}`,
+      consoleUrl: resolvedConsoleUrl,
       status: "RUNNING",
       nodes: initialNodes,
       isAwaitingApproval: false,
       compensationDone: false,
     });
+
+    const waitingTimer = setTimeout(() => {
+      setActiveTx((current) => {
+        if (current && current.status === "RUNNING" && current.nodes.every((n) => n.state === "WAITING" || n.state === "PENDING")) {
+          setRunnerWaiting(true);
+        }
+        return current;
+      });
+    }, 4500);
 
     const cleanup = subscribeWorkspaceEvents(
       workspaceId,
@@ -281,6 +298,7 @@ export default function OperatorPage() {
         } | undefined;
 
         if (!snapshot) return;
+        setRunnerWaiting(false);
 
         const rawNodes = snapshot.nodes || [];
         const mappedNodes: NodeState[] = rawNodes.map((n) => ({
@@ -299,7 +317,7 @@ export default function OperatorPage() {
           workspaceId,
           workspaceName,
           transactionId,
-          consoleUrl: consoleUrl || `http://localhost:3000/app/transactions/${transactionId}`,
+          consoleUrl: resolvedConsoleUrl,
           status: snapshot.state || "RUNNING",
           nodes: mappedNodes.length > 0 ? mappedNodes : initialNodes,
           isAwaitingApproval: isApprovalRequired,
@@ -311,7 +329,11 @@ export default function OperatorPage() {
       }
     );
 
-    eventSourceCleanupRef.current = cleanup;
+    eventSourceCleanupRef.current = () => {
+      clearTimeout(waitingTimer);
+      setRunnerWaiting(false);
+      cleanup();
+    };
   }
 
   // Handle Rollback Approval
@@ -433,8 +455,8 @@ export default function OperatorPage() {
 
                 <div
                   className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm leading-relaxed border ${m.role === "user"
-                      ? "bg-white text-black font-normal border-transparent rounded-tr-xs"
-                      : "bg-white/3 text-gray-200 border-white/10 rounded-tl-xs backdrop-blur-md"
+                    ? "bg-white text-black font-normal border-transparent rounded-tr-xs"
+                    : "bg-white/3 text-gray-200 border-white/10 rounded-tl-xs backdrop-blur-md"
                     }`}
                 >
                   <p className="whitespace-pre-wrap">{m.content}</p>
@@ -616,6 +638,24 @@ export default function OperatorPage() {
             </div>
           ) : (
             <div className="space-y-4">
+              {/* Runner Waiting Notice */}
+              {runnerWaiting && (
+                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs flex items-center justify-between gap-3 shadow-sm">
+                  <div className="flex items-center gap-2">
+                    <span className="text-amber-400 font-bold shrink-0">⏳</span>
+                    <span>Waiting for an active WebMCP Browser Runner. Open the MCPx Control Plane to continue.</span>
+                  </div>
+                  <a
+                    href={process.env.NEXT_PUBLIC_MCPX_CONSOLE_URL || "http://localhost:3000/app"}
+                    target="blank"
+                    rel="noopener noreferrer"
+                    className="text-xs font-semibold underline text-amber-300 hover:text-amber-100 shrink-0"
+                  >
+                    Open MCPx ↗
+                  </a>
+                </div>
+              )}
+
               {/* Workspace Header Info */}
               <div className="p-3.5 rounded-xl bg-white/2 border border-white/8">
                 <div className="flex items-center justify-between mb-1">
@@ -625,12 +665,12 @@ export default function OperatorPage() {
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-gray-400">Status</span>
                   <span className={`text-[11px] font-mono px-2 py-0.5 rounded font-medium ${activeTx.status === "COMPENSATED"
-                      ? "bg-purple-500/10 text-purple-300 border border-purple-500/20"
-                      : activeTx.status === "AWAITING_COMPENSATION_APPROVAL"
-                        ? "bg-amber-500/10 text-amber-300 border border-amber-500/20 animate-pulse"
-                        : activeTx.status === "FAILED"
-                          ? "bg-red-500/10 text-red-300 border border-red-500/20"
-                          : "bg-blue-500/10 text-blue-300 border border-blue-500/20"
+                    ? "bg-purple-500/10 text-purple-300 border border-purple-500/20"
+                    : activeTx.status === "AWAITING_COMPENSATION_APPROVAL"
+                      ? "bg-amber-500/10 text-amber-300 border border-amber-500/20 animate-pulse"
+                      : activeTx.status === "FAILED"
+                        ? "bg-red-500/10 text-red-300 border border-red-500/20"
+                        : "bg-blue-500/10 text-blue-300 border border-blue-500/20"
                     }`}>
                     {activeTx.status === "AWAITING_COMPENSATION_APPROVAL" ? "Awaiting Rollback Approval" : activeTx.status}
                   </span>
@@ -645,18 +685,18 @@ export default function OperatorPage() {
                     <div
                       key={node.id}
                       className={`p-3.5 rounded-xl border transition-all ${s === "SUCCEEDED" || s === "RECOVERED"
-                          ? "bg-emerald-950/10 border-emerald-500/20"
-                          : s === "FAILED"
-                            ? "bg-red-950/15 border-red-500/30"
-                            : s === "IN_DOUBT" || s === "RECONCILING"
-                              ? "bg-amber-950/20 border-amber-500/40 shadow-[0_0_15px_rgba(245,158,11,0.1)]"
-                              : s === "COMPENSATING"
-                                ? "bg-purple-950/15 border-purple-500/30"
-                                : s === "COMPENSATED"
-                                  ? "bg-zinc-900/40 border-white/5 opacity-70"
-                                  : s === "EXECUTING"
-                                    ? "bg-blue-950/15 border-blue-500/30"
-                                    : "bg-white/2 border-white/5"
+                        ? "bg-emerald-950/10 border-emerald-500/20"
+                        : s === "FAILED"
+                          ? "bg-red-950/15 border-red-500/30"
+                          : s === "IN_DOUBT" || s === "RECONCILING"
+                            ? "bg-amber-950/20 border-amber-500/40 shadow-[0_0_15px_rgba(245,158,11,0.1)]"
+                            : s === "COMPENSATING"
+                              ? "bg-purple-950/15 border-purple-500/30"
+                              : s === "COMPENSATED"
+                                ? "bg-zinc-900/40 border-white/5 opacity-70"
+                                : s === "EXECUTING"
+                                  ? "bg-blue-950/15 border-blue-500/30"
+                                  : "bg-white/2 border-white/5"
                         }`}
                     >
                       <div className="flex items-center justify-between mb-1">
