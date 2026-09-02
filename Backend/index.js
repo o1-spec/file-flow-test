@@ -1,0 +1,1206 @@
+import express from "express";
+import cors from "cors";
+import dotenv from "dotenv";
+import { Pool } from "pg";
+import { v4 as uuidv4 } from "uuid";
+
+import bcrypt from "bcrypt";
+import jwt from "jsonwebtoken";
+
+import {
+  PutObjectCommand,
+  HeadObjectCommand,
+  GetObjectCommand,
+  DeleteObjectCommand,
+} from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+
+import { s3 } from "./src/s3.js";
+import { enqueueUpload, imageQueue, pdfQueue, videoQueue } from "./src/queue.js";
+import { dlqQueue } from "./src/dlq.js";
+import { logger } from "./src/logger.js";
+import Redis from "ioredis";
+
+import { callLLM } from "./src/agent/llmAdapter.js";
+import {
+  startWorkspaceProvisioning,
+  getTransactionStatus,
+  getTransactionEvents,
+  approveCompensation,
+  rejectCompensation,
+} from "./src/mcpx/mcpxClient.js";
+
+dotenv.config();
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+function getSslConfig(dbUrl) {
+  if (!dbUrl) return false;
+  if (
+    dbUrl.includes("localhost") ||
+    dbUrl.includes("127.0.0.1") ||
+    dbUrl.includes("@postgres:5432")
+  ) {
+    return false;
+  }
+  try {
+    const parsed = new URL(dbUrl);
+    if (parsed.hostname.startsWith("dpg-") && !parsed.hostname.includes(".")) {
+      return false;
+    }
+  } catch (e) {
+    if (dbUrl.includes("@dpg-") && !dbUrl.includes(".render.com")) {
+      return false;
+    }
+  }
+  return { rejectUnauthorized: false };
+}
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: getSslConfig(process.env.DATABASE_URL),
+  max: 20,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 10000,
+});
+
+pool.on("error", (err) => {
+  logger.error("Unexpected error on idle PostgreSQL client", { error: err.message });
+});
+
+const redis = new Redis(process.env.REDIS_URL);
+
+// ---- Auth middleware ----
+function requireAuth(req, res, next) {
+  const header = req.headers.authorization || "";
+  const [type, token] = header.split(" ");
+
+  if (type !== "Bearer" || !token) {
+    return res
+      .status(401)
+      .json({ error: "Missing or invalid Authorization header" });
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    req.user = payload; // { userId, email }
+    next();
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+}
+
+// ---- Admin middleware ----
+// ADMIN_EMAILS is a comma-separated list of email addresses in .env.
+// Any authenticated user whose email appears in that list is an admin.
+// Example:  ADMIN_EMAILS=alice@example.com,bob@example.com
+const ADMIN_EMAILS = new Set(
+  (process.env.ADMIN_EMAILS ?? "")
+    .split(",")
+    .map((e) => e.trim().toLowerCase())
+    .filter(Boolean)
+);
+
+function requireAdmin(req, res, next) {
+  // Must be called after requireAuth so req.user is populated
+  if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+  if (!ADMIN_EMAILS.has(req.user.email?.toLowerCase())) {
+    return res.status(403).json({ error: "Admin access required" });
+  }
+  next();
+}
+
+// ---- Utils ----
+const MAX_BYTES = 100 * 1024 * 1024;
+const ALLOWED_MIME = new Set([
+  "image/png",
+  "image/jpeg",
+  "application/pdf",
+  "video/mp4",
+  "video/quicktime",
+]);
+
+// ---- Routes ----
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// ---------- AUTH ----------
+app.post("/auth/register", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password || password.length < 6) {
+    return res
+      .status(400)
+      .json({ error: "email and password(>=6 chars) are required" });
+  }
+
+  const userId = uuidv4();
+  const passwordHash = await bcrypt.hash(password, 12);
+
+  try {
+    await pool.query(
+      `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, $3)`,
+      [userId, email.toLowerCase(), passwordHash]
+    );
+  } catch (err) {
+    // 23505 = unique_violation: the email column has a UNIQUE constraint
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "Email already registered" });
+    }
+    // Any other DB error (connection down, table missing, etc.)
+    logger.error("register.db_error", { error: err.message, code: err.code });
+    return res.status(500).json({ error: "Registration failed. Please try again." });
+  }
+
+  res.json({ userId });
+});
+
+app.post("/auth/login", async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: "email and password are required" });
+  }
+
+  try {
+    const result = await pool.query(
+      `SELECT id, email, password_hash FROM users WHERE email = $1`,
+      [email.toLowerCase()]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(401).json({ error: "Invalid credentials" });
+    }
+
+    const user = result.rows[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+
+    if (!ok) return res.status(401).json({ error: "Invalid credentials" });
+
+    const isAdmin = ADMIN_EMAILS.has(user.email.toLowerCase());
+
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, isAdmin },
+      process.env.JWT_SECRET,
+      { expiresIn: "1h" }
+    );
+
+    res.json({ token, isAdmin });
+  } catch (err) {
+    logger.error("login.db_error", { error: err.message, code: err.code });
+    res.status(500).json({ error: "Login failed due to database error. Please try again." });
+  }
+});
+
+// ---------- UPLOADS ----------
+
+// Start upload session: returns presigned PUT URL
+app.post("/uploads/start", requireAuth, async (req, res) => {
+  const { filename, mimeType, size } = req.body;
+
+  if (!filename || !mimeType || typeof size !== "number") {
+    return res
+      .status(400)
+      .json({ error: "filename, mimeType, size are required" });
+  }
+
+  if (size > MAX_BYTES) {
+    return res.status(400).json({ error: "Max file size is 20MB" });
+  }
+
+  if (!ALLOWED_MIME.has(mimeType)) {
+    return res.status(400).json({
+      error: "Unsupported file type",
+      allowed: Array.from(ALLOWED_MIME),
+    });
+  }
+
+  const userId = req.user.userId;
+  const uploadId = uuidv4();
+
+  // deterministic-ish key (based on uploadId)
+  const rawKey = `raw/${uploadId}/${filename}`;
+
+  await pool.query(
+    `INSERT INTO uploads (id, user_id, original_filename, mime_type, size_bytes, status, raw_key)
+     VALUES ($1, $2, $3, $4, $5, 'CREATED', $6)`,
+    [uploadId, userId, filename, mimeType, size, rawKey]
+  );
+
+  const cmd = new PutObjectCommand({
+    Bucket: process.env.S3_BUCKET,
+    Key: rawKey,
+    ContentType: mimeType,
+  });
+
+  const presignedUrl = await getSignedUrl(s3, cmd, { expiresIn: 600 });
+
+  return res.json({
+    uploadId,
+    rawKey,
+    presignedUrl,
+    expiresInSeconds: 600,
+  });
+});
+
+// Get upload status (owner-only)
+app.get("/uploads/:id", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const result = await pool.query(
+    `SELECT id, original_filename, mime_type, size_bytes, status, raw_key, processed_key,
+            error_message, created_at, updated_at
+     FROM uploads
+     WHERE id = $1 AND user_id = $2`,
+    [id, req.user.userId]
+  );
+
+  if (result.rowCount === 0) {
+    // don't leak whether it exists
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  res.json(result.rows[0]);
+});
+
+// SSE status stream — client subscribes once and receives push events until terminal
+// GET /uploads/:id/stream
+// Auth via ?token=<jwt> because EventSource cannot set custom headers.
+app.get("/uploads/:id/stream", async (req, res) => {
+  // ── Auth via query param ──────────────────────────────────────────────────
+  const token = req.query.token;
+  if (!token) return res.status(401).json({ error: "token query param required" });
+
+  let userId;
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    userId = payload.userId;
+  } catch {
+    return res.status(401).json({ error: "Invalid or expired token" });
+  }
+
+  const { id } = req.params;
+
+  // ── SSE headers ───────────────────────────────────────────────────────────
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering
+  res.flushHeaders();
+
+  const TERMINAL = new Set(["PROCESSED", "FAILED"]);
+  const INTERVAL_MS = 1500;
+
+  function send(data) {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  // ── Poll Postgres and push changes ────────────────────────────────────────
+  let lastStatus = null;
+  let timer = null;
+
+  async function tick() {
+    try {
+      const result = await pool.query(
+        `SELECT id, original_filename, mime_type, size_bytes, status,
+                raw_key, processed_key, error_message, created_at, updated_at
+         FROM uploads
+         WHERE id = $1 AND user_id = $2`,
+        [id, userId]
+      );
+
+      if (result.rowCount === 0) {
+        send({ error: "Upload not found" });
+        return cleanup();
+      }
+
+      const row = result.rows[0];
+
+      // Only push when status actually changes (or on first tick)
+      if (row.status !== lastStatus) {
+        lastStatus = row.status;
+        send({ upload: row });
+      }
+
+      if (TERMINAL.has(row.status)) {
+        send({ done: true });
+        return cleanup();
+      }
+    } catch (err) {
+      logger.error("sse.tick_error", { uploadId: id, error: err.message });
+      send({ error: "Internal error" });
+      cleanup();
+    }
+  }
+
+  function cleanup() {
+    if (timer) { clearInterval(timer); timer = null; }
+    res.end();
+  }
+
+  // Run first tick immediately, then on interval
+  await tick();
+  if (!res.writableEnded) {
+    timer = setInterval(tick, INTERVAL_MS);
+  }
+
+  // Clean up when the client disconnects
+  req.on("close", cleanup);
+});
+
+// Mark upload complete (owner-only): verifies object exists, marks UPLOADED, enqueues job
+app.post("/uploads/complete", requireAuth, async (req, res) => {
+  const { uploadId } = req.body;
+
+  if (!uploadId) {
+    return res.status(400).json({ error: "uploadId is required" });
+  }
+
+  const existing = await pool.query(
+    `SELECT id, user_id, status, raw_key, mime_type, processed_key, error_message
+     FROM uploads
+     WHERE id = $1`,
+    [uploadId]
+  );
+
+  if (existing.rowCount === 0) {
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  const record = existing.rows[0];
+
+  // ownership check
+  if (record.user_id !== req.user.userId) {
+    // don't leak existence
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  // Idempotency: already moved forward
+  if (record.status !== "CREATED") {
+    return res.json({
+      id: record.id,
+      status: record.status,
+      raw_key: record.raw_key,
+      processed_key: record.processed_key,
+      error_message: record.error_message,
+    });
+  }
+
+  // Verify object exists in storage
+  try {
+    await s3.send(
+      new HeadObjectCommand({
+        Bucket: process.env.S3_BUCKET,
+        Key: record.raw_key,
+      })
+    );
+  } catch {
+    return res.status(400).json({
+      error: "File not found in storage yet. Upload may not be complete.",
+      rawKey: record.raw_key,
+    });
+  }
+
+  // Transition CREATED -> UPLOADED
+  const updated = await pool.query(
+    `UPDATE uploads
+     SET status = 'UPLOADED',
+         updated_at = NOW()
+     WHERE id = $1 AND status = 'CREATED'
+     RETURNING id, status, raw_key, processed_key, error_message`,
+    [uploadId]
+  );
+
+  // Enqueue if we transitioned
+  if (updated.rowCount > 0) {
+    await enqueueUpload({
+      uploadId,
+      rawKey: record.raw_key,
+      mimeType: record.mime_type,
+    });
+    logger.info("upload.enqueued", { uploadId, mimeType: record.mime_type, userId: req.user.userId });
+    return res.json(updated.rows[0]);
+  }
+
+  // Fallback: return current state
+  const again = await pool.query(
+    `SELECT id, status, raw_key, processed_key, error_message
+     FROM uploads
+     WHERE id = $1`,
+    [uploadId]
+  );
+
+  return res.json(again.rows[0]);
+});
+
+// Download processed output (owner-only): streams file through backend so
+// the browser receives it as a same-origin response and triggers a save dialog.
+app.get("/uploads/:id/download", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const result = await pool.query(
+    `SELECT id, status, processed_key, original_filename, mime_type
+     FROM uploads
+     WHERE id = $1 AND user_id = $2`,
+    [id, req.user.userId]
+  );
+
+  if (result.rowCount === 0) {
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  const upload = result.rows[0];
+
+  if (upload.status !== "PROCESSED") {
+    return res.status(400).json({
+      error: "File is not processed yet",
+      status: upload.status,
+    });
+  }
+
+  if (!upload.processed_key) {
+    return res.status(500).json({
+      error: "processed_key missing for a PROCESSED upload",
+    });
+  }
+
+  try {
+    const cmd = new GetObjectCommand({
+      Bucket: process.env.S3_BUCKET,
+      Key: upload.processed_key,
+    });
+
+    const s3Res = await s3.send(cmd);
+
+    const filename = encodeURIComponent(upload.original_filename ?? "download");
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${filename}`);
+    res.setHeader("Content-Type", upload.mime_type ?? "application/octet-stream");
+    if (s3Res.ContentLength) {
+      res.setHeader("Content-Length", s3Res.ContentLength);
+    }
+
+    s3Res.Body.pipe(res);
+  } catch (err) {
+    logger.error("Download stream error", { id, err: err.message });
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Failed to stream file" });
+    }
+  }
+});
+
+// Preview processed output (owner-only): returns a short-lived presigned URL
+// used by the browser for inline image/video preview inside the detail panel.
+app.get("/uploads/:id/preview", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const result = await pool.query(
+    `SELECT id, status, processed_key, mime_type
+     FROM uploads
+     WHERE id = $1 AND user_id = $2`,
+    [id, req.user.userId]
+  );
+
+  if (result.rowCount === 0) {
+    return res.status(404).json({ error: "Upload not found" });
+  }
+
+  const upload = result.rows[0];
+
+  if (upload.status !== "PROCESSED" || !upload.processed_key) {
+    return res.status(400).json({ error: "File is not processed yet" });
+  }
+
+  try {
+    const previewUrl = await getSignedUrl(
+      s3,
+      new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: upload.processed_key }),
+      { expiresIn: 900 }
+    );
+    return res.json({ previewUrl, mimeType: upload.mime_type });
+  } catch (err) {
+    logger.error("preview.presign_failed", { id, err: err.message });
+    return res.status(500).json({ error: "Failed to generate preview URL" });
+  }
+});
+
+// ── Admin routes ─────────────────────────────────────────────────────────────
+
+// GET /uploads — all uploads for the logged-in user
+app.get("/uploads", requireAuth, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, original_filename, mime_type, size_bytes,
+              status, processed_key, error_message, created_at, updated_at
+       FROM uploads
+       WHERE user_id = $1
+       ORDER BY created_at DESC`,
+      [req.user.userId]
+    );
+    res.json({ uploads: result.rows });
+  } catch (err) {
+    logger.error("uploads.list_failed", { error: err.message, userId: req.user.userId });
+    res.status(500).json({ error: "Failed to fetch uploads" });
+  }
+});
+
+// DELETE /uploads/:id — owner deletes their upload (raw + processed files + DB row)
+app.delete("/uploads/:id", requireAuth, async (req, res) => {
+  const { id } = req.params;
+
+  const result = await pool.query(
+    `SELECT id, user_id, raw_key, processed_key FROM uploads WHERE id = $1`,
+    [id]
+  );
+
+  if (result.rowCount === 0) return res.status(404).json({ error: "Upload not found" });
+
+  const upload = result.rows[0];
+  if (upload.user_id !== req.user.userId) {
+    return res.status(404).json({ error: "Upload not found" }); // don't leak existence
+  }
+
+  // Delete files from MinIO — non-fatal if already gone
+  const keysToDelete = [upload.raw_key, upload.processed_key].filter(Boolean);
+  await Promise.allSettled(
+    keysToDelete.map((key) =>
+      s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }))
+    )
+  );
+
+  await pool.query(`DELETE FROM uploads WHERE id = $1`, [id]);
+
+  logger.info("upload.deleted", { uploadId: id, userId: req.user.userId });
+  res.json({ ok: true });
+});
+
+// GET /admin/uploads — all uploads across all users (admin only)
+app.get("/admin/uploads", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const page  = Math.max(1, Number(req.query.page  ?? 1));
+    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const offset = (page - 1) * limit;
+    const status = req.query.status ?? null; // optional filter
+
+    const values = status
+      ? [limit, offset, status]
+      : [limit, offset];
+
+    const whereClause = status ? `WHERE u.status = $3` : "";
+
+    const result = await pool.query(
+      `SELECT u.id,
+              usr.email        AS user_email,
+              u.original_filename,
+              u.mime_type,
+              u.size_bytes,
+              u.status,
+              u.error_message,
+              u.created_at,
+              u.updated_at
+       FROM uploads u
+       JOIN users usr ON u.user_id = usr.id
+       ${whereClause}
+       ORDER BY u.created_at DESC
+       LIMIT $1 OFFSET $2`,
+      values
+    );
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*) FROM uploads u ${whereClause}`,
+      status ? [status] : []
+    );
+
+    res.json({
+      uploads: result.rows,
+      total: Number(countResult.rows[0].count),
+      page,
+      limit,
+    });
+  } catch (err) {
+    logger.error("admin.uploads_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to fetch uploads" });
+  }
+});
+
+// GET /admin/metrics — queue depths + worker metrics snapshot from Redis
+app.get("/admin/metrics", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    // Only count "live" states — completed jobs are removed immediately so
+    // asking for "completed" would always return 0 and be misleading.
+    const LIVE_STATES = ["waiting", "active", "failed", "delayed", "paused"];
+
+    const [imgCounts, pdfCounts, vidCounts, dlqCounts] = await Promise.all([
+      imageQueue.getJobCounts(...LIVE_STATES),
+      pdfQueue.getJobCounts(...LIVE_STATES),
+      videoQueue.getJobCounts(...LIVE_STATES),
+      dlqQueue.getJobCounts("waiting", "active", "failed"),
+    ]);
+
+    // Worker metrics published by worker process every 10 s
+    const workerMetricsRaw = await redis.get("worker:metrics");
+    const workerMetrics = workerMetricsRaw ? JSON.parse(workerMetricsRaw) : null;
+
+    // Worker heartbeat — if older than 30 s, worker is likely down
+    const heartbeatRaw = await redis.get("worker:heartbeat");
+    const workerAlive = heartbeatRaw
+      ? Date.now() - Number(heartbeatRaw) < 30_000
+      : false;
+
+    res.json({
+      queues: {
+        image: imgCounts,
+        pdf:   pdfCounts,
+        video: vidCounts,
+        dlq:   dlqCounts,
+      },
+      worker: {
+        alive:     workerAlive,
+        lastSeen:  heartbeatRaw ? new Date(Number(heartbeatRaw)).toISOString() : null,
+        metrics:   workerMetrics,
+      },
+    });
+  } catch (err) {
+    logger.error("admin.metrics_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to fetch metrics" });
+  }
+});
+
+// GET /admin/failed — last 50 failed uploads from the DB
+app.get("/admin/failed", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const limit = Math.min(Number(req.query.limit ?? 50), 200);
+    const result = await pool.query(
+      `SELECT id, user_id, original_filename, mime_type, size_bytes,
+              status, error_message, created_at, updated_at
+       FROM uploads
+       WHERE status = 'FAILED'
+       ORDER BY updated_at DESC
+       LIMIT $1`,
+      [limit]
+    );
+    res.json({ failed: result.rows, total: result.rowCount });
+  } catch (err) {
+    logger.error("admin.failed_query_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to fetch failed uploads" });
+  }
+});
+
+// GET /admin/dlq — inspect DLQ jobs (last 50)
+app.get("/admin/dlq", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const jobs = await dlqQueue.getJobs(["waiting"], 0, 49);
+    res.json({
+      dlq: jobs.map((j) => ({
+        dlqJobId:      j.id,
+        originalQueue: j.data.originalQueue,
+        originalJobId: j.data.originalJobId,
+        uploadId:      j.data.payload?.uploadId,
+        mimeType:      j.data.payload?.mimeType,
+        failedAt:      j.data.failedAt,
+        errorMessage:  j.data.errorMessage,
+        attemptsMade:  j.data.attemptsMade,
+      })),
+    });
+  } catch (err) {
+    logger.error("admin.dlq_query_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to fetch DLQ" });
+  }
+});
+
+// DELETE /admin/uploads/:id — admin hard-deletes any upload (MinIO + DB)
+app.delete("/admin/uploads/:id", requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT id, user_id, raw_key, processed_key, original_filename FROM uploads WHERE id = $1`,
+      [id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Upload not found" });
+
+    const upload = result.rows[0];
+    const keysToDelete = [upload.raw_key, upload.processed_key].filter(Boolean);
+    await Promise.allSettled(
+      keysToDelete.map((key) =>
+        s3.send(new DeleteObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }))
+      )
+    );
+    await pool.query(`DELETE FROM uploads WHERE id = $1`, [id]);
+    logger.info("admin.upload_deleted", {
+      uploadId: id,
+      filename: upload.original_filename,
+      deletedBy: req.user.email,
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    logger.error("admin.delete_failed", { uploadId: id, error: err.message });
+    res.status(500).json({ error: "Delete failed" });
+  }
+});
+
+// GET /admin/uploads/:id — full detail + presigned raw & processed URLs
+app.get("/admin/uploads/:id", requireAuth, requireAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const result = await pool.query(
+      `SELECT u.id, usr.email AS user_email, u.original_filename, u.mime_type,
+              u.size_bytes, u.status, u.error_message,
+              u.raw_key, u.processed_key, u.created_at, u.updated_at
+       FROM uploads u
+       JOIN users usr ON u.user_id = usr.id
+       WHERE u.id = $1`,
+      [id]
+    );
+    if (result.rowCount === 0) return res.status(404).json({ error: "Upload not found" });
+
+    const upload = result.rows[0];
+
+    // Generate presigned URLs valid for 15 min each (best-effort — key may not exist yet)
+    async function presign(key) {
+      if (!key) return null;
+      try {
+        return await getSignedUrl(
+          s3,
+          new GetObjectCommand({ Bucket: process.env.S3_BUCKET, Key: key }),
+          { expiresIn: 900 }
+        );
+      } catch { return null; }
+    }
+
+    const [rawUrl, processedUrl] = await Promise.all([
+      presign(upload.raw_key),
+      presign(upload.processed_key),
+    ]);
+
+    res.json({ upload, rawUrl, processedUrl });
+  } catch (err) {
+    logger.error("admin.upload_detail_failed", { uploadId: id, error: err.message });
+    res.status(500).json({ error: "Failed to fetch upload detail" });
+  }
+});
+
+// GET /admin/users — all users with upload stats
+app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT
+         u.id,
+         u.email,
+         u.created_at AS joined_at,
+         COUNT(up.id)::int                                          AS total_uploads,
+         COUNT(up.id) FILTER (WHERE up.status = 'PROCESSED')::int  AS processed_uploads,
+         COUNT(up.id) FILTER (WHERE up.status = 'FAILED')::int     AS failed_uploads,
+         COALESCE(SUM(up.size_bytes) FILTER (WHERE up.size_bytes IS NOT NULL), 0)::bigint AS storage_bytes,
+         MAX(up.created_at)                                         AS last_upload_at
+       FROM users u
+       LEFT JOIN uploads up ON up.user_id = u.id
+       GROUP BY u.id, u.email, u.created_at
+       ORDER BY u.created_at DESC`
+    );
+    res.json({ users: result.rows, total: result.rowCount });
+  } catch (err) {
+    logger.error("admin.users_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to fetch users" });
+  }
+});
+
+// POST /admin/dlq/:jobId/replay — re-enqueue a DLQ job
+app.post("/admin/dlq/:jobId/replay", requireAuth, requireAdmin, async (req, res) => {
+  const { jobId } = req.params;
+  try {
+    const job = await dlqQueue.getJob(jobId);
+    if (!job) return res.status(404).json({ error: "DLQ job not found" });
+
+    const { uploadId, rawKey, mimeType } = job.data.payload ?? {};
+    if (!uploadId || !mimeType) {
+      return res.status(400).json({ error: "DLQ job payload is incomplete" });
+    }
+
+    // Reset the upload status back to UPLOADED so the worker will pick it up
+    await pool.query(
+      `UPDATE uploads SET status = 'UPLOADED', error_message = NULL, updated_at = NOW()
+       WHERE id = $1`,
+      [uploadId]
+    );
+
+    await enqueueUpload({ uploadId, rawKey, mimeType });
+
+    // Remove from DLQ
+    await job.remove();
+
+    logger.info("admin.replay", { uploadId, mimeType, replayedBy: req.user.userId });
+    res.json({ ok: true, uploadId, message: "Re-enqueued for processing" });
+  } catch (err) {
+    logger.error("admin.replay_failed", { jobId, error: err.message });
+    res.status(500).json({ error: "Replay failed" });
+  }
+});
+
+// ── Agent & Workspaces Routes (MCPx Integration) ────────────────────────────
+
+// POST /agent/chat — AI Operations Agent conversation and tool calling
+app.post("/agent/chat", async (req, res) => {
+  const { message, conversationHistory = [] } = req.body;
+
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message string is required" });
+  }
+
+  try {
+    const messages = [
+      ...conversationHistory.map((m) => ({ role: m.role, content: m.content })),
+      { role: "user", content: message },
+    ];
+
+    const llmResult = await callLLM({ messages });
+
+    let toolExecutionResult = null;
+
+    // If the agent invoked get_workspace_status, execute read-only tool immediately
+    if (llmResult.toolCalls && llmResult.toolCalls.length > 0) {
+      const toolCall = llmResult.toolCalls[0];
+      if (toolCall.name === "get_workspace_status") {
+        const { workspaceName, transactionId } = toolCall.arguments;
+
+        let query = `SELECT * FROM workspaces WHERE 1=1`;
+        const params = [];
+        if (workspaceName) {
+          params.push(`%${workspaceName}%`);
+          query += ` AND name ILIKE $${params.length}`;
+        }
+        if (transactionId) {
+          params.push(transactionId);
+          query += ` AND transaction_id = $${params.length}`;
+        }
+        query += ` ORDER BY created_at DESC LIMIT 1`;
+
+        const dbRes = await pool.query(query, params);
+        if (dbRes.rowCount > 0) {
+          const ws = dbRes.rows[0];
+          let mcpxSnap = null;
+          if (ws.transaction_id) {
+            try {
+              mcpxSnap = await getTransactionStatus(ws.transaction_id);
+            } catch (err) {
+              logger.warn("agent.mcpx_status_fetch_failed", { error: err.message });
+            }
+          }
+
+          toolExecutionResult = {
+            found: true,
+            workspace: ws,
+            mcpxStatus: mcpxSnap?.state || ws.status,
+            nodes: mcpxSnap?.nodes || [],
+            consoleUrl: ws.console_url,
+          };
+        } else {
+          toolExecutionResult = {
+            found: false,
+            message: `No active workspace found matching "${workspaceName || transactionId}".`,
+          };
+        }
+      }
+    }
+
+    res.json({
+      reply: llmResult.text,
+      toolCall: llmResult.toolCalls?.[0] || null,
+      toolExecutionResult,
+      provider: llmResult.provider,
+      model: llmResult.model,
+    });
+  } catch (err) {
+    logger.error("agent.chat_error", { error: err.message });
+    res.status(500).json({ error: "Agent execution failed", details: err.message });
+  }
+});
+
+// GET /workspaces — List all processing workspaces
+app.get("/workspaces", async (req, res) => {
+  try {
+    const result = await pool.query(
+      `SELECT id, name, environment, region, worker_concurrency, transaction_id, status, console_url, created_at, updated_at
+       FROM workspaces
+       ORDER BY created_at DESC`
+    );
+    res.json({ workspaces: result.rows });
+  } catch (err) {
+    logger.error("workspaces.list_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to list workspaces" });
+  }
+});
+
+// POST /workspaces/provision — Confirmed provision workspace action (triggers MCPx workflow via SDK)
+app.post("/workspaces/provision", async (req, res) => {
+  const { name, environment = "Production", region = "Europe West", workerConcurrency = 4 } = req.body;
+
+  if (!name) {
+    return res.status(400).json({ error: "Workspace name is required" });
+  }
+
+  const workspaceId = uuidv4();
+
+  try {
+    // 1. Record preliminary workspace row
+    await pool.query(
+      `INSERT INTO workspaces (id, name, environment, region, worker_concurrency, status)
+       VALUES ($1, $2, $3, $4, $5, 'PROVISIONING')`,
+      [workspaceId, name, environment, region, workerConcurrency]
+    );
+
+    // 2. Invoke MCPx via @mcpxx/sdk
+    const mcpxResult = await startWorkspaceProvisioning({
+      name,
+      environment,
+      region,
+      workerConcurrency,
+    });
+
+    // 3. Update workspace with real MCPx transactionId and consoleUrl
+    const updated = await pool.query(
+      `UPDATE workspaces
+       SET transaction_id = $2,
+           status = $3,
+           console_url = $4,
+           mcpx_state = $5,
+           updated_at = NOW()
+       WHERE id = $1
+       RETURNING *`,
+      [
+        workspaceId,
+        mcpxResult.transactionId,
+        mcpxResult.status,
+        mcpxResult.consoleUrl,
+        JSON.stringify(mcpxResult.snapshot || {}),
+      ]
+    );
+
+    logger.info("workspace.provision_initiated", {
+      workspaceId,
+      name,
+      transactionId: mcpxResult.transactionId,
+      consoleUrl: mcpxResult.consoleUrl,
+    });
+
+    res.json({
+      workspace: updated.rows[0],
+      transactionId: mcpxResult.transactionId,
+      consoleUrl: mcpxResult.consoleUrl,
+      snapshot: mcpxResult.snapshot,
+    });
+  } catch (err) {
+    logger.error("workspace.provision_failed", { error: err.message });
+    await pool.query(
+      `UPDATE workspaces SET status = 'FAILED', updated_at = NOW() WHERE id = $1`,
+      [workspaceId]
+    ).catch(() => {});
+
+    res.status(500).json({
+      error: "Workspace provisioning failed via MCPx SDK",
+      details: err.message,
+      workspaceId,
+    });
+  }
+});
+
+// GET /workspaces/:id — Get workspace and real-time MCPx transaction state
+app.get("/workspaces/:id", async (req, res) => {
+  const { id } = req.params;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM workspaces WHERE id = $1 OR name = $1 OR transaction_id = $1`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    const workspace = result.rows[0];
+    let mcpxSnapshot = null;
+
+    if (workspace.transaction_id) {
+      try {
+        mcpxSnapshot = await getTransactionStatus(workspace.transaction_id);
+        if (mcpxSnapshot?.state && mcpxSnapshot.state !== workspace.status) {
+          await pool.query(
+            `UPDATE workspaces SET status = $2, mcpx_state = $3, updated_at = NOW() WHERE id = $1`,
+            [workspace.id, mcpxSnapshot.state, JSON.stringify(mcpxSnapshot)]
+          );
+          workspace.status = mcpxSnapshot.state;
+          workspace.mcpx_state = mcpxSnapshot;
+        }
+      } catch (err) {
+        logger.warn("workspace.mcpx_snapshot_error", { transactionId: workspace.transaction_id, error: err.message });
+      }
+    }
+
+    res.json({ workspace, mcpxSnapshot });
+  } catch (err) {
+    logger.error("workspace.fetch_failed", { id, error: err.message });
+    res.status(500).json({ error: "Failed to fetch workspace" });
+  }
+});
+
+// GET /workspaces/:id/events — SSE status stream for live MCPx transaction events
+app.get("/workspaces/:id/events", async (req, res) => {
+  const { id } = req.params;
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+  res.flushHeaders();
+
+  function send(data) {
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  }
+
+  let timer = null;
+  let isCleanedUp = false;
+
+  function cleanup() {
+    if (isCleanedUp) return;
+    isCleanedUp = true;
+    if (timer) { clearInterval(timer); timer = null; }
+    res.end();
+  }
+
+  req.on("close", cleanup);
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      send({ error: "Workspace not found" });
+      return cleanup();
+    }
+
+    const workspace = result.rows[0];
+    const transactionId = workspace.transaction_id;
+
+    if (!transactionId) {
+      send({ workspace, done: true });
+      return cleanup();
+    }
+
+    const TERMINAL_STATES = new Set(["COMMITTED", "COMPENSATED", "FAILED", "ABORTED"]);
+    let lastSnapshotJson = "";
+
+    async function pollSnapshot() {
+      if (isCleanedUp) return;
+      try {
+        const snapshot = await getTransactionStatus(transactionId);
+        const currentJson = JSON.stringify(snapshot);
+
+        if (currentJson !== lastSnapshotJson) {
+          lastSnapshotJson = currentJson;
+
+          // Update DB if state changed
+          if (snapshot.state !== workspace.status) {
+            await pool.query(
+              `UPDATE workspaces SET status = $2, mcpx_state = $3, updated_at = NOW() WHERE id = $1`,
+              [workspace.id, snapshot.state, JSON.stringify(snapshot)]
+            ).catch(() => {});
+          }
+
+          send({ snapshot, status: snapshot.state });
+        }
+
+        if (TERMINAL_STATES.has(snapshot.state)) {
+          send({ done: true, snapshot, finalState: snapshot.state });
+          cleanup();
+        }
+      } catch (err) {
+        send({ error: "MCPx event polling error", details: err.message });
+      }
+    }
+
+    // Initial poll
+    await pollSnapshot();
+    if (!res.writableEnded && !isCleanedUp) {
+      timer = setInterval(pollSnapshot, 800);
+    }
+  } catch (err) {
+    logger.error("workspace.events_error", { id, error: err.message });
+    send({ error: "Internal SSE error" });
+    cleanup();
+  }
+});
+
+// POST /workspaces/:id/approve-rollback — Approve compensation rollback in MCPx via @mcpxx/sdk
+app.post("/workspaces/:id/approve-rollback", async (req, res) => {
+  const { id } = req.params;
+  const { reason = "Approved by operator in FileFlow Console" } = req.body;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    const workspace = result.rows[0];
+    if (!workspace.transaction_id) {
+      return res.status(400).json({ error: "Workspace has no associated MCPx transaction" });
+    }
+
+    const updatedSnapshot = await approveCompensation(workspace.transaction_id, reason);
+
+    await pool.query(
+      `UPDATE workspaces SET status = $2, mcpx_state = $3, updated_at = NOW() WHERE id = $1`,
+      [workspace.id, updatedSnapshot.state || "COMPENSATING", JSON.stringify(updatedSnapshot)]
+    );
+
+    logger.info("workspace.rollback_approved", {
+      workspaceId: workspace.id,
+      transactionId: workspace.transaction_id,
+    });
+
+    res.json({ ok: true, snapshot: updatedSnapshot });
+  } catch (err) {
+    logger.error("workspace.approve_rollback_failed", { id, error: err.message });
+    res.status(500).json({ error: "Rollback approval failed", details: err.message });
+  }
+});
+
+// POST /workspaces/:id/reject-rollback — Reject compensation rollback in MCPx via @mcpxx/sdk
+app.post("/workspaces/:id/reject-rollback", async (req, res) => {
+  const { id } = req.params;
+  const { reason = "Rejected by operator in FileFlow Console" } = req.body;
+
+  try {
+    const result = await pool.query(
+      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Workspace not found" });
+    }
+
+    const workspace = result.rows[0];
+    if (!workspace.transaction_id) {
+      return res.status(400).json({ error: "Workspace has no associated MCPx transaction" });
+    }
+
+    const updatedSnapshot = await rejectCompensation(workspace.transaction_id, reason);
+
+    res.json({ ok: true, snapshot: updatedSnapshot });
+  } catch (err) {
+    logger.error("workspace.reject_rollback_failed", { id, error: err.message });
+    res.status(500).json({ error: "Rollback rejection failed", details: err.message });
+  }
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  logger.info("api.started", { port: PORT, pid: process.pid });
+});
