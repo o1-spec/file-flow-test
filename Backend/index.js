@@ -21,7 +21,7 @@ import { dlqQueue } from "./src/dlq.js";
 import { logger } from "./src/logger.js";
 import Redis from "ioredis";
 
-import { callLLM } from "./src/agent/llmAdapter.js";
+import { callLLM, evaluateAgentDecision, AGENT_GOAL } from "./src/agent/llmAdapter.js";
 import {
   startWorkspaceProvisioning,
   getTransactionStatus,
@@ -804,35 +804,226 @@ app.get("/admin/users", requireAuth, requireAdmin, async (req, res) => {
   }
 });
 
+// Helper function to safely replay a job from the Dead-Letter Queue (DLQ)
+export async function replayDLQJob(jobId, trigger = "admin") {
+  const job = await dlqQueue.getJob(jobId);
+  if (!job) {
+    throw new Error(`DLQ job '${jobId}' not found`);
+  }
+
+  const { uploadId, rawKey, mimeType } = job.data.payload ?? {};
+  if (!uploadId || !mimeType) {
+    throw new Error("DLQ job payload is incomplete");
+  }
+
+  // Reset upload status back to UPLOADED so the worker will pick it up
+  await pool.query(
+    `UPDATE uploads SET status = 'UPLOADED', error_message = NULL, updated_at = NOW()
+     WHERE id = $1`,
+    [uploadId]
+  );
+
+  await enqueueUpload({ uploadId, rawKey, mimeType });
+
+  // Remove from DLQ
+  await job.remove();
+
+  logger.info("dlq.job_replayed", { uploadId, mimeType, jobId, trigger });
+  return { ok: true, uploadId, jobId, message: "Re-enqueued for processing" };
+}
+
 // POST /admin/dlq/:jobId/replay — re-enqueue a DLQ job
 app.post("/admin/dlq/:jobId/replay", requireAuth, requireAdmin, async (req, res) => {
   const { jobId } = req.params;
   try {
-    const job = await dlqQueue.getJob(jobId);
-    if (!job) return res.status(404).json({ error: "DLQ job not found" });
-
-    const { uploadId, rawKey, mimeType } = job.data.payload ?? {};
-    if (!uploadId || !mimeType) {
-      return res.status(400).json({ error: "DLQ job payload is incomplete" });
-    }
-
-    // Reset the upload status back to UPLOADED so the worker will pick it up
-    await pool.query(
-      `UPDATE uploads SET status = 'UPLOADED', error_message = NULL, updated_at = NOW()
-       WHERE id = $1`,
-      [uploadId]
-    );
-
-    await enqueueUpload({ uploadId, rawKey, mimeType });
-
-    // Remove from DLQ
-    await job.remove();
-
-    logger.info("admin.replay", { uploadId, mimeType, replayedBy: req.user.userId });
-    res.json({ ok: true, uploadId, message: "Re-enqueued for processing" });
+    const result = await replayDLQJob(jobId, `admin:${req.user.userId}`);
+    res.json(result);
   } catch (err) {
     logger.error("admin.replay_failed", { jobId, error: err.message });
-    res.status(500).json({ error: "Replay failed" });
+    res.status(err.message.includes("not found") ? 404 : 500).json({ error: err.message });
+  }
+});
+
+// Helper function to build structured AgentObservation from real telemetry
+export async function getAgentObservation() {
+  const LIVE_STATES = ["waiting", "active", "failed", "delayed", "paused"];
+
+  // 1. Live BullMQ queue depths
+  const [imgCounts, pdfCounts, vidCounts, dlqCounts] = await Promise.all([
+    imageQueue.getJobCounts(...LIVE_STATES),
+    pdfQueue.getJobCounts(...LIVE_STATES),
+    videoQueue.getJobCounts(...LIVE_STATES),
+    dlqQueue.getJobCounts("waiting", "active", "failed"),
+  ]);
+
+  // 2. Worker heartbeat from Redis (30s TTL window)
+  const heartbeatRaw = await redis.get("worker:heartbeat");
+  const workerAlive = heartbeatRaw
+    ? Date.now() - Number(heartbeatRaw) < 30_000
+    : false;
+  const workerLastSeenSecondsAgo = heartbeatRaw
+    ? Math.max(0, Math.round((Date.now() - Number(heartbeatRaw)) / 1000))
+    : null;
+
+  // 3. Workload from PostgreSQL uploads table
+  const pendingFilesRes = await pool.query(
+    `SELECT id, original_filename, mime_type, size_bytes, status, created_at, updated_at
+     FROM uploads
+     WHERE status IN ('CREATED', 'UPLOADED', 'PROCESSING')
+     ORDER BY created_at DESC LIMIT 20`
+  );
+
+  const failedFilesRes = await pool.query(
+    `SELECT id, original_filename, mime_type, size_bytes, status, error_message, updated_at
+     FROM uploads
+     WHERE status = 'FAILED'
+     ORDER BY updated_at DESC LIMIT 10`
+  );
+
+  // 4. DLQ entries from BullMQ with file names
+  const dlqJobs = await dlqQueue.getJobs(["waiting"], 0, 9);
+  const dlq = [];
+  for (const j of dlqJobs) {
+    const uId = j.data?.payload?.uploadId;
+    let filename = j.data?.payload?.originalFilename || `upload-${uId?.slice(0, 8) || "item"}`;
+    if (uId) {
+      const fileRes = await pool.query(`SELECT original_filename FROM uploads WHERE id = $1`, [uId]);
+      if (fileRes.rowCount > 0 && fileRes.rows[0].original_filename) {
+        filename = fileRes.rows[0].original_filename;
+      }
+    }
+    dlq.push({
+      jobId: j.id,
+      uploadId: uId,
+      filename,
+      queue: j.data?.originalQueue || "processing",
+      attemptsMade: j.data?.attemptsMade || 0,
+      errorMessage: j.data?.errorMessage || "Execution error",
+      failedAt: j.data?.failedAt,
+    });
+  }
+
+  // 5. Latest Workspace state from DB
+  const wsRes = await pool.query(
+    `SELECT id, name, environment, region, worker_concurrency, transaction_id, status, console_url, updated_at
+     FROM workspaces
+     ORDER BY updated_at DESC LIMIT 1`
+  );
+  const latestWorkspace = wsRes.rowCount > 0 ? wsRes.rows[0] : null;
+
+  const totalWaiting = (imgCounts.waiting || 0) + (pdfCounts.waiting || 0) + (vidCounts.video || 0);
+  const totalActive = (imgCounts.active || 0) + (pdfCounts.active || 0) + (vidCounts.active || 0);
+  const totalFailed = (imgCounts.failed || 0) + (pdfCounts.failed || 0) + (vidCounts.failed || 0);
+
+  return {
+    timestamp: new Date().toISOString(),
+    goal: AGENT_GOAL,
+    pipeline: {
+      workerOnline: workerAlive,
+      workerLastSeenSecondsAgo,
+      queues: {
+        waiting: totalWaiting,
+        active: totalActive,
+        failed: totalFailed,
+        dlqWaiting: dlqCounts.waiting || 0,
+        details: {
+          image: imgCounts,
+          pdf: pdfCounts,
+          video: vidCounts,
+          dlq: dlqCounts,
+        },
+      },
+    },
+    workload: {
+      pendingCount: pendingFilesRes.rowCount,
+      pendingFiles: pendingFilesRes.rows.map((r) => ({
+        id: r.id,
+        filename: r.original_filename,
+        mimeType: r.mime_type,
+        status: r.status,
+      })),
+      failedCount: failedFilesRes.rowCount,
+      failedFiles: failedFilesRes.rows.map((r) => ({
+        id: r.id,
+        filename: r.original_filename,
+        mimeType: r.mime_type,
+        errorMessage: r.error_message,
+      })),
+    },
+    dlq,
+    workspace: {
+      latest: latestWorkspace,
+    },
+  };
+}
+
+// ── Autonomous Operations Agent Endpoints ───────────────────────────────────
+
+// GET /agent/observe — Real-time aggregated FileFlow telemetry observation
+app.get("/agent/observe", async (req, res) => {
+  try {
+    const observation = await getAgentObservation();
+    res.json(observation);
+  } catch (err) {
+    logger.error("agent.observe_failed", { error: err.message });
+    res.status(500).json({ error: "Failed to gather telemetry observation", details: err.message });
+  }
+});
+
+// POST /agent/evaluate — Evaluate observation against agent goal & perform/propose action
+app.post("/agent/evaluate", async (req, res) => {
+  const { mode = "auto_execute", userMessage = "" } = req.body || {};
+
+  try {
+    const observation = await getAgentObservation();
+    const decision = await evaluateAgentDecision({
+      observation,
+      goal: AGENT_GOAL,
+      userMessage,
+    });
+
+    let executedAction = null;
+    let postObservation = null;
+
+    // Autonomous Mutation: Only replay_failed_job when worker is online and mode allows auto_execute
+    if (
+      decision.status === "AUTONOMOUS_ACTION" &&
+      decision.action?.tool === "replay_failed_job" &&
+      mode === "auto_execute"
+    ) {
+      const jobId = decision.action.arguments?.jobId;
+      if (jobId && observation.pipeline.workerOnline === true) {
+        try {
+          const replayRes = await replayDLQJob(jobId, "agent:autonomous");
+          executedAction = {
+            tool: "replay_failed_job",
+            jobId,
+            result: replayRes,
+          };
+          // Re-observe immediately to capture updated queue state
+          postObservation = await getAgentObservation();
+        } catch (replayErr) {
+          logger.warn("agent.autonomous_replay_failed", { jobId, error: replayErr.message });
+          executedAction = {
+            tool: "replay_failed_job",
+            jobId,
+            error: replayErr.message,
+          };
+        }
+      }
+    }
+
+    res.json({
+      timestamp: new Date().toISOString(),
+      goal: AGENT_GOAL,
+      observation,
+      decision,
+      executedAction,
+      postObservation: postObservation || observation,
+    });
+  } catch (err) {
+    logger.error("agent.evaluate_failed", { error: err.message });
+    res.status(500).json({ error: "Agent evaluation failed", details: err.message });
   }
 });
 

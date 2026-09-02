@@ -183,7 +183,21 @@ export async function getAdminUsers() {
   return handleJSONResponse(res);
 }
 
-// ── Agent & Workspaces (MCPx Integration) ───────────────────────────────────
+export async function getAgentObserve() {
+  const res = await fetch(`${BASE}/agent/observe`, {
+    headers: { ...authHeaders() },
+  });
+  return handleJSONResponse(res);
+}
+
+export async function evaluateAgent(payload: { mode?: "observe_only" | "auto_execute"; userMessage?: string } = {}) {
+  const res = await fetch(`${BASE}/agent/evaluate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...authHeaders() },
+    body: JSON.stringify(payload),
+  });
+  return handleJSONResponse(res);
+}
 
 export async function sendAgentChat(message: string, conversationHistory: { role: string; content: string }[] = []) {
   const res = await fetch(`${BASE}/agent/chat`, {

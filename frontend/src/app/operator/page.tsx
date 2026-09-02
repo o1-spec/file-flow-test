@@ -1,8 +1,7 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import {
-  PaperAirplaneIcon,
   SparklesIcon,
   ServerStackIcon,
   CheckCircleIcon,
@@ -11,51 +10,83 @@ import {
   ExclamationTriangleIcon,
   ArrowTopRightOnSquareIcon,
   ShieldCheckIcon,
-  CubeTransparentIcon
+  CubeTransparentIcon,
+  PaperAirplaneIcon,
+  BoltIcon,
+  ClockIcon,
+  DocumentDuplicateIcon,
 } from "@heroicons/react/24/outline";
 import {
+  getAgentObserve,
+  evaluateAgent,
   sendAgentChat,
   provisionWorkspace,
   approveWorkspaceRollback,
   rejectWorkspaceRollback,
-  subscribeWorkspaceEvents
+  subscribeWorkspaceEvents,
 } from "@/lib/api";
 
-interface StatusDetails {
-  found?: boolean;
-  message?: string;
-  workspace?: {
-    id: string;
-    name: string;
-    environment: string;
-    region: string;
-    worker_concurrency: number;
-    transaction_id: string | null;
-    status: string;
-    console_url: string | null;
+interface AgentObservationData {
+  timestamp: string;
+  goal: string;
+  pipeline: {
+    workerOnline: boolean;
+    workerLastSeenSecondsAgo: number | null;
+    queues: {
+      waiting: number;
+      active: number;
+      failed: number;
+      dlqWaiting: number;
+      details?: Record<string, unknown>;
+    };
   };
-  mcpxStatus?: string;
-  nodes?: Array<{ id: string; label?: string; state: string }>;
-  consoleUrl?: string | null;
+  workload: {
+    pendingCount: number;
+    pendingFiles: Array<{ id: string; filename: string; mimeType: string; status: string }>;
+    failedCount: number;
+    failedFiles: Array<{ id: string; filename: string; mimeType: string; errorMessage?: string }>;
+  };
+  dlq: Array<{
+    jobId: string;
+    uploadId?: string;
+    filename: string;
+    queue: string;
+    attemptsMade: number;
+    errorMessage: string;
+    failedAt?: string;
+  }>;
+  workspace: {
+    latest?: {
+      id: string;
+      name: string;
+      environment: string;
+      region: string;
+      worker_concurrency: number;
+      transaction_id: string | null;
+      status: string;
+      console_url: string | null;
+      updated_at: string;
+    } | null;
+  };
 }
 
-interface Message {
+interface AgentDecisionData {
+  status: "NO_ACTION_REQUIRED" | "AUTONOMOUS_ACTION" | "APPROVAL_REQUIRED" | "BLOCKED";
+  reason: string;
+  action?: {
+    tool: string;
+    arguments: Record<string, unknown>;
+  };
+  provider?: string;
+  model?: string;
+}
+
+interface ActivityEvent {
   id: string;
-  role: "user" | "assistant";
-  content: string;
+  type: "OBSERVED" | "DECIDED" | "ACTED" | "VERIFIED" | "ERROR";
+  summary: string;
+  detail?: string;
   timestamp: string;
-  toolProposal?: {
-    name: string;
-    arguments: {
-      name?: string;
-      environment?: string;
-      region?: string;
-      workerConcurrency?: number;
-      workspaceName?: string;
-      transactionId?: string;
-    };
-  } | null;
-  statusDetails?: StatusDetails | null;
 }
 
 interface NodeState {
@@ -79,38 +110,30 @@ interface ActiveTransaction {
 }
 
 export default function OperatorPage() {
-  const [messages, setMessages] = useState<Message[]>([
-    {
-      id: "welcome",
-      role: "assistant",
-      content: "FileFlow AI Operations Agent ready.\n\nI can provision isolated processing workspaces with crash-resilient multi-step workflows and inspect live pipelines through MCPx.",
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    },
-  ]);
-  const [input, setInput] = useState("");
-  const [loading, setLoading] = useState(false);
+  const [observation, setObservation] = useState<AgentObservationData | null>(null);
+  const [decision, setDecision] = useState<AgentDecisionData | null>(null);
+  const [evaluating, setEvaluating] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<"ACTIVE" | "EVALUATING" | "WAITING_APPROVAL" | "BLOCKED" | "IDLE">("IDLE");
+  const [activityLog, setActivityLog] = useState<ActivityEvent[]>([]);
+  const [workspaceProposal, setWorkspaceProposal] = useState<{
+    name: string;
+    environment: string;
+    region: string;
+    workerConcurrency: number;
+  } | null>(null);
+
+  // MCPx Active Workflow State
   const [activeTx, setActiveTx] = useState<ActiveTransaction | null>(null);
   const [approving, setApproving] = useState(false);
   const [runnerOffline, setRunnerOffline] = useState(false);
   const [runnerWaiting, setRunnerWaiting] = useState(false);
-  const [agentProvider, setAgentProvider] = useState<string>("Gemini");
 
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // Manual prompt fallback
+  const [inputPrompt, setInputPrompt] = useState("");
+  const [manualLoading, setManualLoading] = useState(false);
+
   const eventSourceCleanupRef = useRef<(() => void) | null>(null);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, activeTx]);
-
-  useEffect(() => {
-    return () => {
-      if (eventSourceCleanupRef.current) {
-        eventSourceCleanupRef.current();
-      }
-    };
-  }, []);
-
-  // Standard FileFlow domain label dictionary
   function getFileFlowLabel(nodeKey: string, fallback: string = "") {
     const key = (nodeKey || "").toLowerCase();
     if (key.includes("database") || key === "db") return "Workspace Database";
@@ -120,742 +143,674 @@ export default function OperatorPage() {
     return fallback || nodeKey;
   }
 
-  // Handle User Message Submission
-  async function handleSend(textToSend?: string) {
-    const text = (textToSend || input).trim();
-    if (!text || loading) return;
+  // Add event to activity log
+  const pushActivity = useCallback((type: ActivityEvent["type"], summary: string, detail?: string) => {
+    setActivityLog((prev) => [
+      {
+        id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+        type,
+        summary,
+        detail,
+        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }),
+      },
+      ...prev.slice(0, 19),
+    ]);
+  }, []);
 
-    setInput("");
-    const userMsg: Message = {
-      id: `usr_${Date.now()}`,
-      role: "user",
-      content: text,
-      timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-    };
+  // Fetch live observation from backend
+  const fetchObservation = useCallback(async () => {
+    try {
+      const data = await getAgentObserve();
+      setObservation(data as unknown as AgentObservationData);
+      return data as unknown as AgentObservationData;
+    } catch (err: unknown) {
+      console.error("Failed to fetch observation", err);
+      return null;
+    }
+  }, []);
 
-    setMessages((prev) => [...prev, userMsg]);
-    setLoading(true);
+  // Run structured evaluation cycle (OBSERVE -> DECIDE -> ACT/PROPOSE -> VERIFY)
+  const runAgentEvaluation = useCallback(async (customMessage?: string) => {
+    if (evaluating) return;
+    setEvaluating(true);
+    setAgentStatus("EVALUATING");
 
     try {
-      const history = messages
-        .filter((m) => m.id !== "welcome")
-        .map((m) => ({ role: m.role, content: m.content }));
+      const preObs = await fetchObservation();
+      const workerState = preObs?.pipeline.workerOnline ? "Online" : "Offline";
+      const dlqCount = preObs?.dlq.length || 0;
+      pushActivity(
+        "OBSERVED",
+        `Worker ${workerState} (${preObs?.pipeline.workerLastSeenSecondsAgo != null ? `${preObs.pipeline.workerLastSeenSecondsAgo}s ago` : "heartbeat absent"}), Queues: ${preObs?.pipeline.queues.waiting || 0} waiting, ${preObs?.pipeline.queues.active || 0} active, ${dlqCount} in DLQ.`
+      );
 
-      const res = await sendAgentChat(text, history);
-
-      const data = res as {
-        reply?: string;
-        toolCall?: Message["toolProposal"];
-        toolExecutionResult?: StatusDetails;
-        provider?: string;
+      const evalRes = (await evaluateAgent({
+        mode: "auto_execute",
+        userMessage: customMessage || "",
+      })) as {
+        observation: AgentObservationData;
+        decision: AgentDecisionData;
+        executedAction?: { tool: string; jobId?: string; result?: Record<string, unknown>; error?: string } | null;
+        postObservation?: AgentObservationData;
       };
 
-      if (data.provider) {
-        setAgentProvider(data.provider === "gemini" ? "Gemini" : data.provider === "openai" ? "OpenAI" : "Local Adapter");
-      }
+      const dec = evalRes.decision;
+      setDecision(dec);
 
-      const agentMsg: Message = {
-        id: `agent_${Date.now()}`,
-        role: "assistant",
-        content: data.reply || "Operation processed.",
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        toolProposal: data.toolCall || null,
-        statusDetails: data.toolExecutionResult || null,
-      };
+      pushActivity(
+        "DECIDED",
+        `${dec.status}: ${dec.reason}`
+      );
 
-      setMessages((prev) => [...prev, agentMsg]);
+      if (dec.status === "AUTONOMOUS_ACTION" && evalRes.executedAction) {
+        pushActivity(
+          "ACTED",
+          `Autonomous mutation executed: ${evalRes.executedAction.tool}`,
+          JSON.stringify(evalRes.executedAction.result || evalRes.executedAction.error)
+        );
 
-      // If status tool returned workspace details and it has active transaction
-      if (data.toolExecutionResult?.workspace?.transaction_id) {
-        const ws = data.toolExecutionResult.workspace;
-        if (ws.transaction_id) {
-          startLiveTracking(ws.id, ws.name, ws.transaction_id, ws.console_url || "");
+        if (evalRes.postObservation) {
+          setObservation(evalRes.postObservation);
+          pushActivity(
+            "VERIFIED",
+            `DLQ count is now ${evalRes.postObservation.dlq.length}, job transitioned back to active processing queue.`
+          );
         }
+        setAgentStatus("ACTIVE");
+      } else if (dec.status === "APPROVAL_REQUIRED" && dec.action?.tool === "provision_processing_workspace") {
+        setWorkspaceProposal({
+          name: String(dec.action.arguments.name || "invoices-prod"),
+          environment: String(dec.action.arguments.environment || "Production"),
+          region: String(dec.action.arguments.region || "Europe West"),
+          workerConcurrency: Number(dec.action.arguments.workerConcurrency || 4),
+        });
+        setAgentStatus("WAITING_APPROVAL");
+      } else if (dec.status === "BLOCKED") {
+        setAgentStatus("BLOCKED");
+      } else {
+        setAgentStatus("ACTIVE");
       }
     } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : (err as { message?: string })?.message || "Unknown error";
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err_${Date.now()}`,
-          role: "assistant",
-          content: `⚠️ Failed to execute agent request: ${errMsg}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
+      console.error("Agent evaluation failed", err);
+      pushActivity("ERROR", "Evaluation cycle failed", err instanceof Error ? err.message : String(err));
+      setAgentStatus("IDLE");
     } finally {
-      setLoading(false);
+      setEvaluating(false);
     }
-  }
+  }, [evaluating, fetchObservation, pushActivity]);
 
-  // Handle User Confirming Provisioning from Action Plan Card
-  async function handleConfirmProvision(proposal: Message["toolProposal"]) {
-    if (!proposal || !proposal.arguments.name) return;
+  // Initial load: observe and run first clean evaluation
+  useEffect(() => {
+    fetchObservation().then(() => {
+      runAgentEvaluation();
+    });
+    return () => {
+      if (eventSourceCleanupRef.current) eventSourceCleanupRef.current();
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-    const { name, environment, region, workerConcurrency } = proposal.arguments;
-    setLoading(true);
+  // Handle workspace provisioning approval -> invokes MCPx via @mcpxx/sdk
+  async function handleConfirmProvision() {
+    if (!workspaceProposal) return;
+    const proposal = workspaceProposal;
+    setWorkspaceProposal(null);
+    setApproving(true);
+    setAgentStatus("ACTIVE");
 
-    setMessages((prev) => [
-      ...prev,
-      {
-        id: `confirm_${Date.now()}`,
-        role: "user",
-        content: `Confirmed: Provision workspace "${name}".`,
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      },
-      {
-        id: `starting_${Date.now()}`,
-        role: "assistant",
-        content: `Dispatching canonical multi-step challenge workflow for **${name}** via @mcpxx/sdk...`,
-        timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-      },
-    ]);
+    pushActivity(
+      "ACTED",
+      `Operator authorized workspace provisioning: ${proposal.name} (${proposal.environment}, ${proposal.region}, ${proposal.workerConcurrency} workers). Delegating to MCPx.`
+    );
 
     try {
-      const res = await provisionWorkspace({
-        name,
-        environment: environment || "Production",
-        region: region || "Europe West",
-        workerConcurrency: Number(workerConcurrency) || 4,
-      });
-
-      const { workspace, transactionId, consoleUrl } = res as {
-        workspace: { id: string };
+      const res = (await provisionWorkspace({
+        name: proposal.name,
+        environment: proposal.environment,
+        region: proposal.region,
+        workerConcurrency: proposal.workerConcurrency,
+      })) as {
+        workspace: { id: string; name: string };
         transactionId: string;
         consoleUrl: string;
       };
-      startLiveTracking(workspace.id, name, transactionId, consoleUrl);
-    } catch (err: unknown) {
-      const errObj = err as { details?: string; message?: string };
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `fail_${Date.now()}`,
-          role: "assistant",
-          content: `❌ Provisioning initiation failed: ${errObj?.details || errObj?.message || "MCPx Coordinator unreachable"}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
+
+      const workspaceId = res.workspace.id;
+      const transactionId = res.transactionId;
+      const consoleUrl = res.consoleUrl || `${process.env.NEXT_PUBLIC_MCPX_CONSOLE_URL || "http://localhost:3000"}/app/transactions/${transactionId}`;
+
+      setActiveTx({
+        workspaceId,
+        workspaceName: proposal.name,
+        transactionId,
+        consoleUrl,
+        status: "PROVISIONING",
+        nodes: [],
+        isAwaitingApproval: false,
+        compensationDone: false,
+      });
+
+      // Subscribe to live SSE events from FileFlow backend
+      const cleanup = subscribeWorkspaceEvents(
+        workspaceId,
+        (data: Record<string, unknown>) => {
+          if (data.type === "init") {
+            const rawNodes = (data.nodes as Array<{ id: string; label?: string; state: string; error?: string }>) || [];
+            setActiveTx((prev) => {
+              if (!prev) return null;
+              return {
+                ...prev,
+                status: (data.status as string) || prev.status,
+                nodes: rawNodes.map((n) => ({
+                  id: n.id,
+                  fileflowLabel: getFileFlowLabel(n.id, n.label || n.id),
+                  state: n.state as NodeState["state"],
+                  error: n.error || null,
+                })),
+              };
+            });
+          } else if (data.type === "node_update") {
+            const node = data.node as { id: string; label?: string; state: string; error?: string };
+            if (!node) return;
+            setActiveTx((prev) => {
+              if (!prev) return null;
+              const exists = prev.nodes.some((n) => n.id === node.id);
+              const updatedNodes: NodeState[] = exists
+                ? prev.nodes.map((n) =>
+                    n.id === node.id
+                      ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
+                      : n
+                  )
+                : [
+                    ...prev.nodes,
+                    {
+                      id: node.id,
+                      fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
+                      state: node.state as NodeState["state"],
+                      error: node.error || null,
+                    },
+                  ];
+
+              return {
+                ...prev,
+                status: (data.overallState as string) || prev.status,
+                nodes: updatedNodes,
+              };
+            });
+          } else if (data.type === "awaiting_approval") {
+            setActiveTx((prev) => (prev ? { ...prev, isAwaitingApproval: true } : null));
+            pushActivity(
+              "DECIDED",
+              "MCPx reported downstream failure during workspace provisioning. Saga rollback is awaiting operator authorization."
+            );
+          } else if (data.type === "compensated") {
+            setActiveTx((prev) =>
+              prev ? { ...prev, isAwaitingApproval: false, compensationDone: true, status: "COMPENSATED" } : null
+            );
+            pushActivity(
+              "VERIFIED",
+              "Saga reverse compensation completed cleanly. All provisioned reference resources verified absent."
+            );
+          }
         },
-      ]);
+        (err) => {
+          console.warn("SSE stream closed", err);
+        }
+      );
+
+      eventSourceCleanupRef.current = cleanup;
+    } catch (err: unknown) {
+      console.error("Workspace provision failed", err);
+      pushActivity("ERROR", "Workspace provisioning failed via @mcpxx/sdk", err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      setApproving(false);
     }
   }
 
-  // Subscribe to live SSE events for active MCPx transaction
-  function startLiveTracking(workspaceId: string, workspaceName: string, transactionId: string, consoleUrl: string) {
-    if (eventSourceCleanupRef.current) {
-      eventSourceCleanupRef.current();
+  // Handle manual prompt submission
+  async function handleManualSubmit() {
+    const text = inputPrompt.trim();
+    if (!text || manualLoading) return;
+    setInputPrompt("");
+    setManualLoading(true);
+
+    try {
+      pushActivity("OBSERVED", `Operator instruction received: "${text}"`);
+      await runAgentEvaluation(text);
+    } catch (err: unknown) {
+      console.error("Manual evaluation failed", err);
+    } finally {
+      setManualLoading(false);
     }
-
-    // Prefer the SDK-returned consoleUrl. Fall back to NEXT_PUBLIC_MCPX_CONSOLE_URL so the
-    // production link resolves correctly without hardcoding localhost in deployed builds.
-    const mcpxConsoleUrl =
-      process.env.NEXT_PUBLIC_MCPX_CONSOLE_URL || "http://localhost:3000";
-    const resolvedConsoleUrl =
-      consoleUrl || `${mcpxConsoleUrl}/app/transactions/${transactionId}`;
-
-    const initialNodes: NodeState[] = [
-      { id: "database", fileflowLabel: "Workspace Database", state: "WAITING" },
-      { id: "compute", fileflowLabel: "Processing Runtime", state: "WAITING" },
-      { id: "routing", fileflowLabel: "Public Endpoint", state: "WAITING" },
-      { id: "frontend", fileflowLabel: "Workspace Console", state: "WAITING" },
-    ];
-
-    setActiveTx({
-      workspaceId,
-      workspaceName,
-      transactionId,
-      consoleUrl: resolvedConsoleUrl,
-      status: "RUNNING",
-      nodes: initialNodes,
-      isAwaitingApproval: false,
-      compensationDone: false,
-    });
-
-    const waitingTimer = setTimeout(() => {
-      setActiveTx((current) => {
-        if (current && current.status === "RUNNING" && current.nodes.every((n) => n.state === "WAITING" || n.state === "PENDING")) {
-          setRunnerWaiting(true);
-        }
-        return current;
-      });
-    }, 4500);
-
-    const cleanup = subscribeWorkspaceEvents(
-      workspaceId,
-      (data: Record<string, unknown>) => {
-        if (data.error) {
-          const errStr = String(data.error);
-          if (errStr.includes("runner") || errStr.includes("offline")) {
-            setRunnerOffline(true);
-          }
-          return;
-        }
-
-        const snapshot = data.snapshot as {
-          state?: string;
-          nodes?: Array<{ id?: string; nodeId?: string; label?: string; state?: string; error?: string }>;
-        } | undefined;
-
-        if (!snapshot) return;
-        setRunnerWaiting(false);
-
-        const rawNodes = snapshot.nodes || [];
-        const mappedNodes: NodeState[] = rawNodes.map((n) => ({
-          id: n.id || n.nodeId || "node",
-          nodeId: n.nodeId || n.id,
-          label: n.label,
-          fileflowLabel: getFileFlowLabel(n.nodeId || n.id || "", n.label),
-          state: (n.state || "PENDING").toUpperCase() as NodeState["state"],
-          error: n.error || null,
-        }));
-
-        const isApprovalRequired = snapshot.state === "AWAITING_COMPENSATION_APPROVAL";
-        const isCompensated = snapshot.state === "COMPENSATED";
-
-        setActiveTx({
-          workspaceId,
-          workspaceName,
-          transactionId,
-          consoleUrl: resolvedConsoleUrl,
-          status: snapshot.state || "RUNNING",
-          nodes: mappedNodes.length > 0 ? mappedNodes : initialNodes,
-          isAwaitingApproval: isApprovalRequired,
-          compensationDone: isCompensated,
-        });
-      },
-      (err) => {
-        console.warn("Workspace SSE stream interrupted:", err);
-      }
-    );
-
-    eventSourceCleanupRef.current = () => {
-      clearTimeout(waitingTimer);
-      setRunnerWaiting(false);
-      cleanup();
-    };
   }
 
   // Handle Rollback Approval
   async function handleApproveRollback() {
     if (!activeTx) return;
     setApproving(true);
-
     try {
-      await approveWorkspaceRollback(activeTx.workspaceId);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `approve_${Date.now()}`,
-          role: "user",
-          content: "Approved rollback compensation.",
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-        {
-          id: `rolling_${Date.now()}`,
-          role: "assistant",
-          content: "Rollback approved. MCPx is removing provisioned resources in reverse dependency order...",
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
+      await approveWorkspaceRollback(activeTx.workspaceId, "Operator approved compensation via Agent Console");
+      pushActivity("ACTED", `Operator approved compensation rollback for transaction ${activeTx.transactionId}`);
     } catch (err: unknown) {
-      const errMsg = err instanceof Error ? err.message : (err as { message?: string })?.message || "Unknown error";
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `err_${Date.now()}`,
-          role: "assistant",
-          content: `Failed to approve rollback: ${errMsg}`,
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
+      console.error("Rollback approval failed", err);
     } finally {
       setApproving(false);
     }
   }
 
-  // Handle Rollback Rejection
-  async function handleRejectRollback() {
-    if (!activeTx) return;
-    setApproving(true);
-    try {
-      await rejectWorkspaceRollback(activeTx.workspaceId);
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `reject_${Date.now()}`,
-          role: "user",
-          content: "Kept provisioned resources (rejected rollback).",
-          timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-        },
-      ]);
-    } catch (err: unknown) {
-      console.error(err);
-    } finally {
-      setApproving(false);
-    }
-  }
+  const workerOnline = observation?.pipeline.workerOnline === true;
+  const queues = observation?.pipeline.queues || { waiting: 0, active: 0, failed: 0, dlqWaiting: 0 };
+  const dlqItems = observation?.dlq || [];
 
   return (
-    <div className="min-h-[calc(100vh-64px)] w-full bg-[#0a0a0a] text-white flex flex-col font-sans selection:bg-indigo-500/30">
-
-      {/* Top Header Bar */}
-      <div className="border-b border-white/8 bg-[#0d0d0d] px-6 py-4 flex items-center justify-between">
-        <div className="flex items-center gap-3">
-          <div className="w-8 h-8 rounded-lg bg-indigo-500/10 border border-indigo-500/20 flex items-center justify-center text-indigo-400 shadow-sm">
-            <SparklesIcon className="w-4 h-4" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-base font-semibold text-white tracking-tight">FileFlow Operator</h1>
-              <span className="text-[10px] px-2 py-0.5 rounded bg-white/5 border border-white/10 text-gray-300 font-mono">
-                Agent provider: {agentProvider}
-              </span>
-            </div>
-            <p className="text-xs text-gray-400 mt-0.5">
-              Manage FileFlow processing infrastructure with an AI operations agent.
-            </p>
-          </div>
-        </div>
-
-        <div className="flex items-center gap-3">
-          {runnerOffline ? (
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
-              <ExclamationTriangleIcon className="w-3.5 h-3.5" />
-              Waiting for MCPx Browser Runner
-            </span>
-          ) : (
-            <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-              MCPx Control Plane Ready
-            </span>
-          )}
-        </div>
-      </div>
-
-      {/* Main Grid: Command Interface Left, Live Timeline Right */}
-      <div className="flex-1 grid grid-cols-1 lg:grid-cols-12 max-w-7xl w-full mx-auto p-4 sm:p-6 gap-6">
-
-        {/* Left Column: Command & Reasoning Stream */}
-        <div className="lg:col-span-7 flex flex-col h-[calc(100vh-180px)] bg-[#0d0d0d] border border-white/8 rounded-2xl overflow-hidden shadow-2xl">
-
-          {/* Messages Stream */}
-          <div className="flex-1 overflow-y-auto p-5 space-y-4">
-            {messages.map((m) => (
-              <div
-                key={m.id}
-                className={`flex flex-col ${m.role === "user" ? "items-end" : "items-start"}`}
-              >
-                <div className="flex items-center gap-1.5 mb-1 px-1">
-                  <span className="text-[11px] font-medium text-gray-400">
-                    {m.role === "user" ? "You" : "Operator Agent"}
-                  </span>
-                  <span className="text-[10px] text-gray-600">{m.timestamp}</span>
-                </div>
-
-                <div
-                  className={`max-w-[92%] rounded-2xl px-4 py-3 text-sm leading-relaxed border ${m.role === "user"
-                    ? "bg-white text-black font-normal border-transparent rounded-tr-xs"
-                    : "bg-white/3 text-gray-200 border-white/10 rounded-tl-xs backdrop-blur-md"
-                    }`}
-                >
-                  <p className="whitespace-pre-wrap">{m.content}</p>
-
-                  {/* Action Plan Card for provision_workspace */}
-                  {m.toolProposal && m.toolProposal.name === "provision_workspace" && (
-                    <div className="mt-4 p-4 rounded-xl bg-black/70 border border-indigo-500/30 text-white shadow-xl animate-in fade-in zoom-in-95 duration-200">
-                      <div className="flex items-center gap-2 mb-3 pb-2 border-b border-white/10 text-xs font-semibold uppercase tracking-wider text-indigo-300">
-                        <ServerStackIcon className="w-4 h-4 text-indigo-400" />
-                        Provision Processing Workspace
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-2 text-xs mb-4">
-                        <div className="p-2.5 rounded-lg bg-white/5 border border-white/5">
-                          <div className="text-gray-400 text-[10px] uppercase font-medium">Name</div>
-                          <div className="font-semibold text-white font-mono mt-0.5">{m.toolProposal.arguments.name}</div>
-                        </div>
-                        <div className="p-2.5 rounded-lg bg-white/5 border border-white/5">
-                          <div className="text-gray-400 text-[10px] uppercase font-medium">Environment</div>
-                          <div className="font-semibold text-white mt-0.5">{m.toolProposal.arguments.environment || "Production"}</div>
-                        </div>
-                        <div className="p-2.5 rounded-lg bg-white/5 border border-white/5">
-                          <div className="text-gray-400 text-[10px] uppercase font-medium">Workers</div>
-                          <div className="font-semibold text-white mt-0.5">{m.toolProposal.arguments.workerConcurrency || 4} concurrency slots</div>
-                        </div>
-                        <div className="p-2.5 rounded-lg bg-white/5 border border-white/5">
-                          <div className="text-gray-400 text-[10px] uppercase font-medium">Region</div>
-                          <div className="font-semibold text-white mt-0.5">{m.toolProposal.arguments.region || "Europe West"}</div>
-                        </div>
-                      </div>
-
-                      <div className="text-xs text-gray-300 mb-4 bg-white/3 p-2.5 rounded-lg border border-white/5">
-                        <span className="text-gray-400 font-medium block mb-1.5">This operation will provision:</span>
-                        <div className="grid grid-cols-2 gap-1 text-[11px] text-gray-300">
-                          <div>• Workspace Database</div>
-                          <div>• Processing Runtime</div>
-                          <div>• Public Endpoint</div>
-                          <div>• Workspace Console</div>
-                        </div>
-                      </div>
-
-                      <div className="flex gap-2.5">
-                        <button
-                          onClick={() => handleConfirmProvision(m.toolProposal)}
-                          disabled={loading}
-                          className="flex-1 py-2.5 px-3 rounded-lg bg-indigo-500 text-white font-semibold text-xs hover:bg-indigo-600 transition-all shadow-md flex items-center justify-center gap-1.5"
-                        >
-                          <CheckCircleIcon className="w-4 h-4" />
-                          Provision Workspace
-                        </button>
-                        <button
-                          onClick={() => {
-                            setMessages((prev) => [
-                              ...prev,
-                              {
-                                id: `cancel_${Date.now()}`,
-                                role: "user",
-                                content: "Cancelled workspace provisioning.",
-                                timestamp: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }),
-                              },
-                            ]);
-                          }}
-                          className="py-2.5 px-4 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-gray-400 hover:text-white text-xs font-medium transition-colors"
-                        >
-                          Cancel
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* Status Details Card */}
-                  {m.statusDetails && (
-                    <div className="mt-3 p-3.5 rounded-xl bg-black/50 border border-white/10 text-xs">
-                      {m.statusDetails.found && m.statusDetails.workspace ? (
-                        <div>
-                          <div className="flex items-center justify-between mb-2">
-                            <span className="font-semibold text-white">{m.statusDetails.workspace.name}</span>
-                            <span className="text-[10px] px-2 py-0.5 rounded bg-white/10 text-indigo-300 font-mono">
-                              {m.statusDetails.mcpxStatus}
-                            </span>
-                          </div>
-                          <p className="text-gray-400 text-[11px] mb-2">
-                            Environment: {m.statusDetails.workspace.environment} • Region: {m.statusDetails.workspace.region}
-                          </p>
-                          {m.statusDetails.consoleUrl && (
-                            <a
-                              href={m.statusDetails.consoleUrl}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="inline-flex items-center gap-1 text-indigo-400 hover:underline text-[11px]"
-                            >
-                              View Transaction in MCPx →
-                            </a>
-                          )}
-                        </div>
-                      ) : (
-                        <p className="text-gray-400">{m.statusDetails.message}</p>
-                      )}
-                    </div>
-                  )}
-                </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
+      {/* Top Header / Agent Goal Banner */}
+      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md px-6 py-4 sticky top-0 z-30">
+        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div className="flex items-center gap-3">
+            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-purple-600 to-cyan-400 p-0.5 shadow-lg shadow-indigo-500/20">
+              <div className="w-full h-full bg-slate-950 rounded-[10px] flex items-center justify-center">
+                <SparklesIcon className="w-5 h-5 text-indigo-400" />
               </div>
-            ))}
-
-            {loading && (
-              <div className="flex items-center gap-2 text-xs text-gray-400 italic py-2">
-                <ArrowPathIcon className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                Operator reasoning & evaluating tools...
-              </div>
-            )}
-            <div ref={messagesEndRef} />
-          </div>
-
-          {/* Quick Command Prompt */}
-          <div className="px-4 py-2.5 bg-black/40 border-t border-white/5 flex gap-2 overflow-x-auto text-[11px]">
-            <button
-              onClick={() => handleSend("Provision a production workspace called invoices-prod with four workers.")}
-              className="whitespace-nowrap px-3 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white transition-colors"
-            >
-              + Provision a production workspace called invoices-prod with four workers.
-            </button>
-            <button
-              onClick={() => handleSend("Check the status of invoices-prod.")}
-              className="whitespace-nowrap px-3 py-1.5 rounded-full border border-white/10 bg-white/5 hover:bg-white/10 text-gray-300 hover:text-white transition-colors"
-            >
-              🔍 Check status of invoices-prod
-            </button>
-          </div>
-
-          {/* Input Form */}
-          <form
-            onSubmit={(e) => {
-              e.preventDefault();
-              handleSend();
-            }}
-            className="p-3 bg-[#111] border-t border-white/8 flex items-center gap-2"
-          >
-            <input
-              type="text"
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              placeholder="Ask the operator to provision or inspect processing workspaces..."
-              disabled={loading}
-              className="flex-1 bg-white/5 border border-white/10 rounded-xl px-4 py-2.5 text-sm text-white placeholder-gray-500 focus:outline-none focus:border-white/20 transition-all font-light"
-            />
-            <button
-              type="submit"
-              disabled={loading || !input.trim()}
-              className="p-2.5 rounded-xl bg-white text-black font-semibold hover:bg-gray-200 disabled:opacity-40 disabled:hover:bg-white transition-all shadow-sm"
-            >
-              <PaperAirplaneIcon className="w-4 h-4" />
-            </button>
-          </form>
-        </div>
-
-        {/* Right Column: Live Multi-Step Execution Timeline */}
-        <div className="lg:col-span-5 flex flex-col h-[calc(100vh-180px)] bg-[#0d0d0d] border border-white/8 rounded-2xl p-5 overflow-y-auto shadow-2xl">
-          <div className="flex items-center justify-between pb-4 border-b border-white/8 mb-4">
-            <div className="flex items-center gap-2">
-              <CubeTransparentIcon className="w-4 h-4 text-indigo-400" />
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-gray-300">
-                Live Orchestration Timeline
-              </h2>
             </div>
-            {activeTx && (
-              <span className="font-mono text-[10px] text-gray-500 truncate max-w-35" title={activeTx.transactionId}>
-                {activeTx.transactionId}
-              </span>
-            )}
-          </div>
-
-          {!activeTx ? (
-            <div className="flex-1 flex flex-col items-center justify-center text-center p-6 text-gray-500">
-              <ServerStackIcon className="w-10 h-10 mb-3 stroke-1 text-gray-600" />
-              <p className="text-sm font-medium text-gray-400">No Active Provisioning Flow</p>
-              <p className="text-xs text-gray-500 mt-1 max-w-xs leading-relaxed">
-                Use the command prompt on the left to start workspace provisioning. Real-time multi-step state and fault reconciliation will appear here.
+            <div>
+              <div className="flex items-center gap-2">
+                <h1 className="text-lg font-bold text-white tracking-tight">FileFlow AI Operations Agent</h1>
+                <span className="text-xs px-2 py-0.5 rounded-full border bg-indigo-950/60 border-indigo-700/50 text-indigo-300 font-mono">
+                  Supervised Autonomy
+                </span>
+              </div>
+              <p className="text-xs text-slate-400">
+                Continuous Telemetry • Autonomous DLQ Recovery • Governed MCPx Workspaces
               </p>
             </div>
-          ) : (
-            <div className="space-y-4">
-              {/* Runner Waiting Notice */}
-              {runnerWaiting && (
-                <div className="p-3.5 rounded-xl bg-amber-500/10 border border-amber-500/20 text-amber-200 text-xs flex items-center justify-between gap-3 shadow-sm">
-                  <div className="flex items-center gap-2">
-                    <span className="text-amber-400 font-bold shrink-0">⏳</span>
-                    <span>Waiting for an active WebMCP Browser Runner. Open the MCPx Control Plane to continue.</span>
-                  </div>
-                  <a
-                    href={process.env.NEXT_PUBLIC_MCPX_CONSOLE_URL || "http://localhost:3000/app"}
-                    target="blank"
-                    rel="noopener noreferrer"
-                    className="text-xs font-semibold underline text-amber-300 hover:text-amber-100 shrink-0"
-                  >
-                    Open MCPx ↗
-                  </a>
-                </div>
-              )}
+          </div>
 
-              {/* Workspace Header Info */}
-              <div className="p-3.5 rounded-xl bg-white/2 border border-white/8">
-                <div className="flex items-center justify-between mb-1">
-                  <span className="text-xs text-gray-400">Workspace</span>
-                  <span className="text-xs font-bold text-white font-mono">{activeTx.workspaceName}</span>
-                </div>
-                <div className="flex items-center justify-between">
-                  <span className="text-xs text-gray-400">Status</span>
-                  <span className={`text-[11px] font-mono px-2 py-0.5 rounded font-medium ${activeTx.status === "COMPENSATED"
-                    ? "bg-purple-500/10 text-purple-300 border border-purple-500/20"
-                    : activeTx.status === "AWAITING_COMPENSATION_APPROVAL"
-                      ? "bg-amber-500/10 text-amber-300 border border-amber-500/20 animate-pulse"
-                      : activeTx.status === "FAILED"
-                        ? "bg-red-500/10 text-red-300 border border-red-500/20"
-                        : "bg-blue-500/10 text-blue-300 border border-blue-500/20"
-                    }`}>
-                    {activeTx.status === "AWAITING_COMPENSATION_APPROVAL" ? "Awaiting Rollback Approval" : activeTx.status}
-                  </span>
+          {/* Goal & Status Pill */}
+          <div className="flex items-center gap-3">
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs">
+              <span className="text-slate-400">Status:</span>
+              {agentStatus === "ACTIVE" && (
+                <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
+                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                  ACTIVE
+                </span>
+              )}
+              {agentStatus === "EVALUATING" && (
+                <span className="flex items-center gap-1.5 text-cyan-400 font-semibold">
+                  <ArrowPathIcon className="w-3.5 h-3.5 animate-spin" />
+                  EVALUATING
+                </span>
+              )}
+              {agentStatus === "WAITING_APPROVAL" && (
+                <span className="flex items-center gap-1.5 text-amber-400 font-semibold">
+                  <ClockIcon className="w-3.5 h-3.5" />
+                  APPROVAL REQUIRED
+                </span>
+              )}
+              {agentStatus === "BLOCKED" && (
+                <span className="flex items-center gap-1.5 text-rose-400 font-semibold">
+                  <ExclamationTriangleIcon className="w-3.5 h-3.5" />
+                  BLOCKED
+                </span>
+              )}
+              {agentStatus === "IDLE" && (
+                <span className="flex items-center gap-1.5 text-slate-400 font-semibold">
+                  IDLE
+                </span>
+              )}
+            </div>
+
+            <button
+              onClick={() => runAgentEvaluation()}
+              disabled={evaluating}
+              className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition"
+            >
+              <ArrowPathIcon className={`w-3.5 h-3.5 ${evaluating ? "animate-spin" : ""}`} />
+              Run Evaluation
+            </button>
+          </div>
+        </div>
+
+        {/* Persistent Goal Statement Banner */}
+        <div className="max-w-7xl mx-auto mt-3 px-3 py-2 rounded-lg bg-indigo-950/40 border border-indigo-900/60 flex items-center gap-2 text-xs text-indigo-200">
+          <BoltIcon className="w-4 h-4 text-indigo-400 shrink-0" />
+          <span className="font-semibold text-indigo-300">Agent Goal:</span>
+          <span>
+            Keep FileFlow&apos;s processing pipeline healthy and recover eligible failed jobs while requiring human approval for consequential workspace operations.
+          </span>
+        </div>
+      </header>
+
+      {/* Main Agent Console Grid */}
+      <main className="max-w-7xl mx-auto w-full p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
+        {/* Left Column: Live Observation & Activity Log (5 cols) */}
+        <div className="lg:col-span-5 flex flex-col gap-6">
+          {/* Live Telemetry Card */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-4">
+              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                <ServerStackIcon className="w-4 h-4 text-indigo-400" />
+                Live Telemetry Observation
+              </h2>
+              <span className="text-[11px] text-slate-400 font-mono">
+                {observation ? new Date(observation.timestamp).toLocaleTimeString() : "--:--:--"}
+              </span>
+            </div>
+
+            {/* Grid of Real Metric Cards */}
+            <div className="grid grid-cols-2 gap-3 mb-4">
+              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
+                <span className="text-[11px] text-slate-400 block mb-1">Worker Heartbeat</span>
+                {workerOnline ? (
+                  <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-semibold">
+                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
+                    Online ({observation?.pipeline.workerLastSeenSecondsAgo ?? 0}s ago)
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-1.5 text-rose-400 text-xs font-semibold">
+                    <span className="w-2 h-2 rounded-full bg-rose-400" />
+                    Offline (Heartbeat absent)
+                  </div>
+                )}
+              </div>
+
+              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
+                <span className="text-[11px] text-slate-400 block mb-1">Queue Backlog</span>
+                <div className="text-xs font-semibold text-slate-200">
+                  {queues.waiting} waiting • {queues.active} active
                 </div>
               </div>
 
-              {/* Compact Vertical Sequence */}
-              <div className="space-y-2.5">
-                {activeTx.nodes.map((node) => {
-                  const s = node.state;
-                  return (
-                    <div
-                      key={node.id}
-                      className={`p-3.5 rounded-xl border transition-all ${s === "SUCCEEDED" || s === "RECOVERED"
-                        ? "bg-emerald-950/10 border-emerald-500/20"
-                        : s === "FAILED"
-                          ? "bg-red-950/15 border-red-500/30"
-                          : s === "IN_DOUBT" || s === "RECONCILING"
-                            ? "bg-amber-950/20 border-amber-500/40 shadow-[0_0_15px_rgba(245,158,11,0.1)]"
-                            : s === "COMPENSATING"
-                              ? "bg-purple-950/15 border-purple-500/30"
-                              : s === "COMPENSATED"
-                                ? "bg-zinc-900/40 border-white/5 opacity-70"
-                                : s === "EXECUTING"
-                                  ? "bg-blue-950/15 border-blue-500/30"
-                                  : "bg-white/2 border-white/5"
+              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
+                <span className="text-[11px] text-slate-400 block mb-1">Dead-Letter Queue (DLQ)</span>
+                <div className={`text-xs font-semibold ${dlqItems.length > 0 ? "text-amber-400 font-bold" : "text-slate-300"}`}>
+                  {dlqItems.length} job(s) in DLQ
+                </div>
+              </div>
+
+              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
+                <span className="text-[11px] text-slate-400 block mb-1">Active Workspaces</span>
+                <div className="text-xs font-semibold text-slate-300 truncate">
+                  {observation?.workspace.latest ? observation.workspace.latest.name : "None"}
+                </div>
+              </div>
+            </div>
+
+            {/* DLQ Detailed Items if present */}
+            {dlqItems.length > 0 && (
+              <div className="border-t border-slate-800/80 pt-3">
+                <span className="text-[11px] text-amber-400 font-semibold block mb-2">
+                  Eligible DLQ Jobs for Recovery:
+                </span>
+                <div className="space-y-2">
+                  {dlqItems.slice(0, 3).map((job) => (
+                    <div key={job.jobId} className="bg-amber-950/20 border border-amber-900/40 rounded-md p-2 text-xs">
+                      <div className="flex justify-between items-center text-slate-200 font-medium">
+                        <span className="truncate">{job.filename}</span>
+                        <span className="text-[10px] text-amber-400 px-1.5 py-0.5 bg-amber-900/40 rounded">
+                          DLQ #{job.jobId}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 truncate mt-0.5">{job.errorMessage}</p>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Activity Log (Observable Sequence) */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex-1 flex flex-col">
+            <h2 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+              <ClockIcon className="w-4 h-4 text-indigo-400" />
+              Agent Activity Sequence
+            </h2>
+            <div className="space-y-2.5 overflow-y-auto max-h-[320px] pr-1 flex-1">
+              {activityLog.length === 0 ? (
+                <p className="text-xs text-slate-400 italic">No agent actions recorded yet.</p>
+              ) : (
+                activityLog.map((act) => (
+                  <div key={act.id} className="text-xs border-l-2 pl-3 py-1 border-slate-700">
+                    <div className="flex items-center gap-2 mb-0.5">
+                      <span
+                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded uppercase ${
+                          act.type === "OBSERVED"
+                            ? "bg-slate-800 text-slate-300"
+                            : act.type === "DECIDED"
+                            ? "bg-indigo-950 text-indigo-300 border border-indigo-800/40"
+                            : act.type === "ACTED"
+                            ? "bg-emerald-950 text-emerald-300 border border-emerald-800/40"
+                            : act.type === "VERIFIED"
+                            ? "bg-cyan-950 text-cyan-300 border border-cyan-800/40"
+                            : "bg-rose-950 text-rose-300"
                         }`}
-                    >
-                      <div className="flex items-center justify-between mb-1">
-                        <div className="flex items-center gap-2">
-                          {s === "SUCCEEDED" && <CheckCircleIcon className="w-4 h-4 text-emerald-400" />}
-                          {s === "RECOVERED" && <CheckCircleIcon className="w-4 h-4 text-emerald-400" />}
-                          {s === "FAILED" && <XCircleIcon className="w-4 h-4 text-red-400" />}
-                          {(s === "IN_DOUBT" || s === "RECONCILING") && (
-                            <ExclamationTriangleIcon className="w-4 h-4 text-amber-400 animate-spin" />
-                          )}
-                          {s === "EXECUTING" && <ArrowPathIcon className="w-4 h-4 text-blue-400 animate-spin" />}
-                          {s === "COMPENSATING" && <ArrowPathIcon className="w-4 h-4 text-purple-400 animate-spin" />}
-                          {s === "COMPENSATED" && <span className="text-xs text-purple-400 font-bold">✕</span>}
-                          {s === "WAITING" && <span className="text-gray-600 text-xs">○</span>}
-
-                          <span className="text-xs font-semibold text-white tracking-tight">
-                            {node.fileflowLabel}
-                          </span>
-                        </div>
-
-                        {/* Human-readable status with secondary technical badge */}
-                        <div className="flex items-center gap-1.5 text-right">
-                          <span className="text-[11px] font-medium text-gray-300">
-                            {s === "WAITING" && "Waiting"}
-                            {s === "EXECUTING" && "Provisioning"}
-                            {s === "SUCCEEDED" && "Ready"}
-                            {s === "IN_DOUBT" && "Confirmation lost"}
-                            {s === "RECONCILING" && "Verifying remote state"}
-                            {s === "RECOVERED" && "Verified"}
-                            {s === "FAILED" && "Deployment failed"}
-                            {s === "COMPENSATING" && "Removing"}
-                            {s === "COMPENSATED" && "Removed"}
-                          </span>
-                          {s === "RECOVERED" && (
-                            <span className="text-[9px] font-mono px-1 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                              RECOVERED
-                            </span>
-                          )}
-                          {s === "FAILED" && (
-                            <span className="text-[9px] font-mono px-1 rounded bg-red-500/20 text-red-300 border border-red-500/30">
-                              REJECTED
-                            </span>
-                          )}
-                        </div>
-                      </div>
-
-                      {/* IN_DOUBT HERO MOMENT: Obvious, readable explanation */}
-                      {s === "IN_DOUBT" && (
-                        <div className="mt-2.5 text-[11px] text-amber-200 leading-relaxed bg-amber-500/10 p-2.5 rounded-lg border border-amber-500/30">
-                          <strong>Confirmation lost:</strong> MCPx did not retry the mutation blindly. It is checking the routing provider for authoritative state.
-                        </div>
-                      )}
-
-                      {s === "RECONCILING" && (
-                        <div className="mt-2.5 text-[11px] text-amber-200 leading-relaxed bg-amber-500/10 p-2.5 rounded-lg border border-amber-500/30 flex items-center gap-2">
-                          <ArrowPathIcon className="w-3.5 h-3.5 animate-spin" />
-                          <span>Verifying remote endpoint state against authoritative provider...</span>
-                        </div>
-                      )}
-
-                      {s === "RECOVERED" && (
-                        <div className="mt-2 text-[11px] text-emerald-300/90 leading-relaxed bg-emerald-500/10 p-2 rounded-lg border border-emerald-500/20">
-                          The route already existed remotely. MCPx recovered the operation without issuing another create request.
-                        </div>
-                      )}
-
-                      {s === "FAILED" && (
-                        <div className="mt-2 text-[11px] text-red-300/90 leading-relaxed bg-red-500/10 p-2 rounded-lg border border-red-500/20">
-                          Deployment rejected before commit. Some upstream infrastructure was already created.
-                        </div>
-                      )}
+                      >
+                        {act.type}
+                      </span>
+                      <span className="text-[10px] text-slate-400">{act.timestamp}</span>
                     </div>
-                  );
-                })}
+                    <p className="text-slate-200 leading-snug">{act.summary}</p>
+                    {act.detail && (
+                      <p className="text-[11px] text-slate-400 font-mono mt-0.5 truncate">{act.detail}</p>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          </div>
+        </div>
+
+        {/* Right Column: Agent Decision, Proposal Card, & Live Orchestration (7 cols) */}
+        <div className="lg:col-span-7 flex flex-col gap-6">
+          {/* Agent Decision Card */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                <SparklesIcon className="w-4 h-4 text-indigo-400" />
+                Latest Decision & Rationale
+              </h2>
+              {decision && (
+                <span
+                  className={`text-xs px-2.5 py-0.5 rounded-full font-semibold border ${
+                    decision.status === "AUTONOMOUS_ACTION"
+                      ? "bg-emerald-950/60 border-emerald-700/50 text-emerald-300"
+                      : decision.status === "APPROVAL_REQUIRED"
+                      ? "bg-amber-950/60 border-amber-700/50 text-amber-300"
+                      : decision.status === "BLOCKED"
+                      ? "bg-rose-950/60 border-rose-700/50 text-rose-300"
+                      : "bg-slate-800 border-slate-700 text-slate-300"
+                  }`}
+                >
+                  {decision.status}
+                </span>
+              )}
+            </div>
+
+            <p className="text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3.5 rounded-lg border border-slate-800/80 mb-3">
+              {decision ? decision.reason : "Evaluating telemetry against persistent goal..."}
+            </p>
+
+            {decision?.action && decision.action.tool !== "none" && (
+              <div className="flex items-center gap-2 text-xs text-slate-400 bg-slate-950/40 px-3 py-2 rounded-lg border border-slate-800/60">
+                <span className="font-semibold text-slate-300">Action:</span>
+                <code className="text-indigo-300 font-mono">{decision.action.tool}</code>
+                {decision.action.arguments && (
+                  <span className="text-[11px] text-slate-400 truncate">
+                    ({Object.entries(decision.action.arguments).map(([k, v]) => `${k}=${v}`).join(", ")})
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Proposal Confirmation Card (when APPROVAL_REQUIRED) */}
+          {workspaceProposal && (
+            <div className="bg-gradient-to-b from-indigo-950/60 to-slate-900 border-2 border-indigo-600/50 rounded-xl p-5 shadow-xl shadow-indigo-950/50 animate-in fade-in zoom-in-95 duration-200">
+              <div className="flex items-center gap-2.5 mb-3 text-indigo-300">
+                <CubeTransparentIcon className="w-5 h-5 text-indigo-400" />
+                <h3 className="text-sm font-bold text-white">Proposal: Provision Processing Workspace</h3>
+              </div>
+              <p className="text-xs text-slate-300 mb-4 leading-relaxed">
+                The agent proposes provisioning an isolated multi-service processing environment for dedicated workloads. Multi-service workspace operations across independent WebMCP reference services are consequential and require explicit operator authorization.
+              </p>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block">Workspace</span>
+                  <span className="text-xs font-semibold text-white">{workspaceProposal.name}</span>
+                </div>
+                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block">Environment</span>
+                  <span className="text-xs font-semibold text-white">{workspaceProposal.environment}</span>
+                </div>
+                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block">Region</span>
+                  <span className="text-xs font-semibold text-white">{workspaceProposal.region}</span>
+                </div>
+                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
+                  <span className="text-[10px] text-slate-400 block">Concurrency</span>
+                  <span className="text-xs font-semibold text-white">{workspaceProposal.workerConcurrency} workers</span>
+                </div>
               </div>
 
-              {/* Failure + Approval Gate */}
-              {activeTx.isAwaitingApproval && (
-                <div className="p-4 rounded-xl bg-amber-950/25 border border-amber-500/40 text-white shadow-2xl animate-in zoom-in-95 duration-200">
-                  <div className="flex items-center gap-2 text-amber-400 text-xs font-bold uppercase tracking-wider mb-2">
-                    <ShieldCheckIcon className="w-4 h-4" />
-                    Rollback Approval Required
-                  </div>
-                  <p className="text-xs text-gray-300 mb-3 leading-relaxed">
-                    Workspace provisioning could not complete because the <strong>Workspace Console</strong> deployment was rejected before commit.
-                  </p>
+              <div className="flex items-center gap-3">
+                <button
+                  onClick={handleConfirmProvision}
+                  disabled={approving}
+                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-lg shadow-indigo-600/30 transition"
+                >
+                  <CheckCircleIcon className="w-4 h-4" />
+                  {approving ? "Initiating @mcpxx/sdk..." : "Approve & Provision via MCPx"}
+                </button>
+                <button
+                  onClick={() => {
+                    setWorkspaceProposal(null);
+                    setAgentStatus("IDLE");
+                    pushActivity("DECIDED", "Operator dismissed workspace provisioning proposal.");
+                  }}
+                  disabled={approving}
+                  className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 text-xs font-semibold rounded-lg transition"
+                >
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
 
-                  <div className="bg-black/50 p-2.5 rounded-lg border border-white/5 mb-3">
-                    <div className="text-[10px] text-gray-400 font-medium uppercase mb-1.5">Already provisioned:</div>
-                    <div className="grid grid-cols-1 gap-1 text-xs">
-                      <div className="flex items-center gap-1.5 text-emerald-400">
-                        <CheckCircleIcon className="w-3.5 h-3.5" /> Workspace Database
-                      </div>
-                      <div className="flex items-center gap-1.5 text-emerald-400">
-                        <CheckCircleIcon className="w-3.5 h-3.5" /> Processing Runtime
-                      </div>
-                      <div className="flex items-center gap-1.5 text-emerald-400">
-                        <CheckCircleIcon className="w-3.5 h-3.5" /> Public Endpoint
-                      </div>
-                    </div>
-                  </div>
-
-                  <p className="text-xs text-gray-300 mb-3">
-                    MCPx can remove these resources in reverse dependency order.
-                  </p>
-
-                  <div className="flex gap-2.5">
-                    <button
-                      onClick={handleApproveRollback}
-                      disabled={approving}
-                      className="flex-1 py-2.5 px-3 rounded-lg bg-amber-500 text-black font-semibold text-xs hover:bg-amber-400 transition-all flex items-center justify-center gap-1.5 shadow-md"
-                    >
-                      {approving ? <ArrowPathIcon className="w-3.5 h-3.5 animate-spin" /> : <CheckCircleIcon className="w-3.5 h-3.5" />}
-                      Approve Rollback
-                    </button>
-                    <button
-                      onClick={handleRejectRollback}
-                      disabled={approving}
-                      className="py-2.5 px-4 rounded-lg border border-white/10 bg-white/5 hover:bg-white/10 text-xs text-gray-300 transition-colors font-medium"
-                    >
-                      Keep Resources
-                    </button>
+          {/* Live MCPx Orchestration Timeline */}
+          {activeTx && (
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
+              <div className="flex items-center justify-between mb-3 border-b border-slate-800 pb-3">
+                <div className="flex items-center gap-2">
+                  <ShieldCheckIcon className="w-5 h-5 text-indigo-400" />
+                  <div>
+                    <h3 className="text-sm font-bold text-white">
+                      MCPx Orchestration: {activeTx.workspaceName}
+                    </h3>
+                    <span className="text-[11px] text-slate-400 font-mono">
+                      Tx: {activeTx.transactionId}
+                    </span>
                   </div>
                 </div>
-              )}
-
-              {/* Final Compensation Complete Banner */}
-              {activeTx.compensationDone && (
-                <div className="p-4 rounded-xl bg-purple-950/25 border border-purple-500/40 text-white shadow-xl animate-in fade-in duration-300">
-                  <div className="flex items-center gap-2 text-purple-300 text-xs font-bold uppercase tracking-wider mb-1.5">
-                    <CheckCircleIcon className="w-4 h-4" />
-                    Workspace Deployment Rolled Back
-                  </div>
-                  <p className="text-xs text-gray-300 leading-relaxed mb-3">
-                    All resources created during this attempt were verified as removed.
-                  </p>
-                  <div className="text-[11px] font-mono text-gray-400 bg-black/50 p-2.5 rounded-lg border border-white/5 space-y-1">
-                    <div>Transaction: <span className="text-white">{activeTx.transactionId}</span></div>
-                    <div>Final state: <span className="text-purple-300 font-semibold">COMPENSATED</span></div>
-                  </div>
-                </div>
-              )}
-
-              {/* View in MCPx Action */}
-              <div className="pt-2">
                 <a
                   href={activeTx.consoleUrl}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="w-full flex items-center justify-center gap-2 py-2.5 px-3 rounded-xl border border-white/10 bg-white/5 hover:bg-white/10 text-xs font-medium text-indigo-300 hover:text-white transition-all shadow-sm group"
+                  className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 font-medium transition"
                 >
-                  <span>View transaction in MCPx</span>
-                  <ArrowTopRightOnSquareIcon className="w-3.5 h-3.5 group-hover:translate-x-0.5 transition-transform" />
+                  Console <ArrowTopRightOnSquareIcon className="w-3.5 h-3.5" />
                 </a>
               </div>
+
+              {/* DAG Nodes visualizer */}
+              <div className="space-y-2 mb-4">
+                {activeTx.nodes.length === 0 ? (
+                  <p className="text-xs text-slate-400 italic">Initializing WebMCP workflow nodes...</p>
+                ) : (
+                  activeTx.nodes.map((node) => (
+                    <div
+                      key={node.id}
+                      className="flex items-center justify-between p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80 text-xs"
+                    >
+                      <div className="flex items-center gap-2">
+                        <span className="font-semibold text-slate-200">{node.fileflowLabel}</span>
+                        <span className="text-[10px] text-slate-400 font-mono">({node.id})</span>
+                      </div>
+                      <span
+                        className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
+                          node.state === "SUCCEEDED"
+                            ? "bg-emerald-950 text-emerald-300 border border-emerald-800/50"
+                            : node.state === "RECOVERED"
+                            ? "bg-teal-950 text-teal-300 border border-teal-800/50"
+                            : node.state === "IN_DOUBT"
+                            ? "bg-amber-950 text-amber-300 border border-amber-800/50 animate-pulse"
+                            : node.state === "FAILED"
+                            ? "bg-rose-950 text-rose-300 border border-rose-800/50"
+                            : node.state === "COMPENSATED"
+                            ? "bg-purple-950 text-purple-300 border border-purple-800/50"
+                            : "bg-slate-800 text-slate-400"
+                        }`}
+                      >
+                        {node.state}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              {/* Compensation Approval Banner if Awaiting Approval */}
+              {activeTx.isAwaitingApproval && !activeTx.compensationDone && (
+                <div className="bg-amber-950/40 border border-amber-800/60 rounded-lg p-3.5 mt-3">
+                  <div className="flex items-center gap-2 text-amber-400 text-xs font-bold mb-1">
+                    <ExclamationTriangleIcon className="w-4 h-4" />
+                    Human Authorization Required for Saga Rollback
+                  </div>
+                  <p className="text-xs text-slate-300 mb-3">
+                    Downstream frontend deployment failed. To prevent orphaned state, MCPx is prepared to reverse-compensate upstream resources in topological order.
+                  </p>
+                  <button
+                    onClick={handleApproveRollback}
+                    disabled={approving}
+                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition shadow-md shadow-amber-950/50"
+                  >
+                    <ArrowPathIcon className={`w-3.5 h-3.5 ${approving ? "animate-spin" : ""}`} />
+                    {approving ? "Executing Rollback..." : "Authorize Saga Reverse Compensation"}
+                  </button>
+                </div>
+              )}
+
+              {activeTx.compensationDone && (
+                <div className="bg-purple-950/40 border border-purple-800/60 rounded-lg p-3 mt-3 text-xs text-purple-300 flex items-center gap-2">
+                  <CheckCircleIcon className="w-4 h-4 text-purple-400" />
+                  Saga rollback verified. Resources created by this transaction were verified absent after compensation.
+                </div>
+              )}
             </div>
           )}
+
+          {/* Manual Operator Instruction Bar */}
+          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 shadow-sm flex items-center gap-2">
+            <input
+              type="text"
+              value={inputPrompt}
+              onChange={(e) => setInputPrompt(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") handleManualSubmit();
+              }}
+              placeholder='Direct operator command (e.g., "Provision a production workspace called invoices-prod with 4 workers")'
+              className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500 transition"
+            />
+            <button
+              onClick={handleManualSubmit}
+              disabled={manualLoading || !inputPrompt.trim()}
+              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
+            >
+              <PaperAirplaneIcon className="w-3.5 h-3.5" />
+              Send
+            </button>
+          </div>
         </div>
-      </div>
+      </main>
     </div>
   );
 }
