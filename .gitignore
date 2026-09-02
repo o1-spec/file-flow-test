@@ -41,3 +41,4 @@ temp/
 .idea/
 *.swp
 *.swo
+deploy-env/

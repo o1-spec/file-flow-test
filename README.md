@@ -1,155 +1,177 @@
-# ⚡️ FileFlow: Distributed Multimedia Pipeline Edge Router
+# ⚡️ FileFlow: Distributed Multimedia Pipeline & Autonomous Operations Agent
 
-**Live Demo:** https://fileflow-frontend.vercel.app/  
+**Live Production App:** [https://file-flow-test.vercel.app](https://file-flow-test.vercel.app)  
+**Operations Agent Console:** [https://file-flow-test.vercel.app/operator](https://file-flow-test.vercel.app/operator)  
+**MCPx Control Plane:** [https://mcpx-mcpx-web.vercel.app](https://mcpx-mcpx-web.vercel.app)  
 **Architecture Deep Dive:** [View ARCHITECTURE.md](./ARCHITECTURE.md)
 
-FileFlow is a distributed, asynchronous file processing platform built to handle multimedia uploads (images, PDFs, videos) without bottlenecking the API gateway. It combines direct-to-storage presigned uploads, asynchronous Redis worker queues, and real-time Server-Sent Events (SSE) status updates.
+FileFlow is a distributed, asynchronous file processing platform and autonomous operations control plane built to handle multimedia uploads (images, PDFs, videos) without bottlenecking the API gateway. It combines direct-to-storage presigned uploads, asynchronous Redis worker queues, real-time Server-Sent Events (SSE) status updates, and a **governed Autonomous AI Operations Agent** for self-healing queue recovery and reliable multi-service workspace provisioning via **MCPx**.
 
 ---
 
-## 🎯 The Problem It Solves
+## 🎯 What FileFlow Does
 
-Traditional monolithic file upload pipelines process heavy file transformations directly on the API web server. Under heavy concurrent load:
-- Large file uploads consume API thread bandwidth and memory.
-- CPU-intensive tasks (image resizing, video transcoding, PDF manipulation) block incoming HTTP requests.
-- Polling for job status wastes server resources.
-
-**FileFlow solves this by decoupling ingestion from compute:**
-1. **Direct Storage Ingestion:** The browser uploads file bytes directly to S3-compatible object storage via short-lived presigned PUT URLs, completely bypassing the API server for file transfers.
-2. **Asynchronous Message Broker:** BullMQ and Redis route processing tasks to dedicated background worker processes with type-specific concurrency limits.
-3. **Real-time Push Observability:** Server-Sent Events (SSE) push live state updates to the UI as workers claim, transform, and complete jobs.
+1. **Direct Storage Ingestion:** The browser transfers files directly to S3-compatible object storage via short-lived presigned PUT URLs, completely bypassing the API server for heavy data transfers.
+2. **Asynchronous Message Broker:** BullMQ and Redis route processing tasks to dedicated background worker processes with type-specific concurrency limits (Images: 10, PDFs: 5, Videos: 2).
+3. **Real-Time Push Observability:** Server-Sent Events (SSE) stream live state transitions to the browser as workers claim, transform, and complete jobs.
+4. **Autonomous AI Operations Agent (`OBSERVE -> DECIDE -> ACT/PROPOSE -> VERIFY`):** A supervised agent monitors Redis worker heartbeats, BullMQ queue depths, and DLQ errors. It autonomously executes low-risk DLQ failure replays and proposes governed, human-approved multi-service workspace operations.
+5. **Reliable WebMCP Orchestration via MCPx:** Consequential multi-step workspace operations are coordinated across 4 independent WebMCP reference services with DAG execution, Saga reverse compensations on failure, and atomic PostgreSQL state tracking.
 
 ---
 
-## 🏗 System Architecture & Data Flow
+## 🏗 System Architecture & Operations Loop
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                      Frontend (Next.js)                         │
-│   /login  ·  /register  ·  /upload  ·  /uploads  ·  /admin      │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ HTTP / Server-Sent Events (SSE)
-                           ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                    Express Backend API (:4000)                  │
-│  Auth  · Presigned S3 URLs · Admin & DLQ APIs · SSE Stream      │
-└────────┬──────────────────────────────────┬─────────────────────┘
-         │ SQL (pg)                         │ BullMQ Jobs
-         ▼                                  ▼
-┌─────────────────┐              ┌──────────────────────────────┐
-│   PostgreSQL    │              │        Redis (:6379)         │
-│  users          │              │  image-processing queue      │
-│  uploads        │              │  pdf-processing queue        │
-└─────────────────┘              │  video-processing queue      │
-                                 │  dlq (Dead Letter Queue)     │
-                                 │  worker telemetry/heartbeats │
-                                 └──────────────┬───────────────┘
-                                                │ BullMQ Polling
-                                                ▼
-                                 ┌──────────────────────────────┐
-                                 │    Standalone Worker Node    │
-                                 │  imageProcessor (Sharp)      │
-                                 │  pdfProcessor (pdf-lib)      │
-                                 │  videoProcessor (FFmpeg)     │
-                                 └──────────────┬───────────────┘
-                                                │ GetObject / PutObject
-                                                ▼
-                                 ┌──────────────────────────────┐
-                                 │   MinIO / S3-Compatible      │
-                                 │  raw/{uploadId}/{file}       │
-                                 │  processed/{uploadId}/output │
-                                 └──────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                             Frontend (Next.js 14)                           │
+│   /login  ·  /register  ·  /upload  ·  /uploads  ·  /admin  ·  /operator    │
+└───────────────────────┬───────────────────────────────┬─────────────────────┘
+                        │ HTTP / SSE                    │ Propose / Approve
+                        ▼                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        Express Backend API (:4000)                          │
+│  Auth  · Presigned S3  · Admin & DLQ APIs  · SSE Stream  · Operations Agent │
+└────────┬──────────────────────────┬───────────────────────────┬─────────────┘
+         │ SQL (pg)                 │ BullMQ Jobs               │ @mcpxx/sdk
+         ▼                          ▼                           ▼
+┌─────────────────┐        ┌──────────────────┐       ┌───────────────────────┐
+│   PostgreSQL    │        │  Redis / BullMQ  │       │   MCPx Coordinator    │
+│  users          │        │  image-queue     │       │  Saga Compensations   │
+│  uploads        │        │  pdf-queue       │       │  PostgreSQL Durability│
+│  workspaces     │        │  video-queue     │       └───────────┬───────────┘
+└─────────────────┘        │  dlq-queue       │                   │ WebMCP Tools
+                           │  worker:heartbeat│                   ▼
+                           └────────┬─────────┘       ┌───────────────────────┐
+                                    │ BullMQ Poll     │ 4 WebMCP Microservices│
+                                    ▼                 │ Routing · Database    │
+                           ┌──────────────────┐       │ Compute · Frontend    │
+                           │ Background Worker│       └───────────────────────┘
+                           │ Sharp · FFmpeg   │
+                           │ pdf-lib          │
+                           └────────┬─────────┘
+                                    │ GetObject / PutObject
+                                    ▼
+                           ┌──────────────────┐
+                           │ S3 / Cloudflare  │
+                           │ raw / processed  │
+                           └──────────────────┘
 ```
 
-### Request Lifecycle
-1. **Initiate (`POST /uploads/start`)**: Frontend sends file metadata. The API creates a database row (`CREATED`) and returns an S3 presigned PUT URL.
-2. **Direct Upload (`PUT <presignedUrl>`)**: The browser transfers the file payload directly to object storage (`raw/{uploadId}/{filename}`).
-3. **Complete & Enqueue (`POST /uploads/complete`)**: The frontend notifies the API. The API verifies object existence in storage, updates status to `UPLOADED`, and enqueues a job into BullMQ.
-4. **Worker Execution**: A worker node claims the job using an optimistic lock (`status = 'PROCESSING'`), streams the raw asset from storage, processes it, uploads the output (`processed/{uploadId}/output`), and marks status as `PROCESSED`.
-5. **Real-time Push (`GET /uploads/:id/stream`)**: The API streams status transitions to the browser via SSE until completion or failure.
+---
+
+## 🤖 The Autonomous Operations Agent
+
+The FileFlow Operations Agent runs on a continuous supervision loop to keep the processing pipeline healthy:
+
+```
+                  ┌──────────────────────────────┐
+                  │       PERSISTENT GOAL        │
+                  │ "Keep pipeline healthy and   │
+                  │ recover failed jobs while    │
+                  │ requiring human approval for │
+                  │ workspace operations"        │
+                  └──────────────┬───────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. OBSERVE (GET /agent/observe)                                 │
+│    • Redis Worker Heartbeat (TTL 30s)                           │
+│    • BullMQ queue depths (image, pdf, video, dlq)               │
+│    • PostgreSQL pending & failed upload records                 │
+│    • Latest MCPx workspace provisioned state                    │
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 2. DECIDE (POST /agent/evaluate via Gemini 2.0 Flash)           │
+│    ├── Pipeline Healthy  ──► NO_ACTION_REQUIRED                 │
+│    ├── DLQ Failed Job    ──► AUTONOMOUS_ACTION (replay_failed)  │
+│    ├── Worker Offline    ──► BLOCKED (awaiting worker reboot)   │
+│    └── Workspace Needed  ──► PROPOSAL_REQUIRED (request approval)│
+└────────────────────────────────┬────────────────────────────────┘
+                                 │
+                 ┌───────────────┴───────────────┐
+                 ▼                               ▼
+┌────────────────────────────────┐ ┌──────────────────────────────┐
+│ 3A. AUTONOMOUS ACTION          │ │ 3B. GOVERNED PROPOSAL        │
+│ • Replay eligible DLQ job      │ │ • Request human confirmation │
+│ • Atomic DB state transition   │ │ • Execute MCPx DAG on approval│
+│ • Worker consumes & processes  │ │ • Reverse compensation on fail│
+└────────────────┬───────────────┘ └──────────────┬───────────────┘
+                 │                                │
+                 └───────────────┬────────────────┘
+                                 ▼
+┌─────────────────────────────────────────────────────────────────┐
+│ 4. VERIFY                                                       │
+│    • Re-sample pipeline telemetry                               │
+│    • Confirm DLQ depth = 0 and file status = PROCESSED          │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
 ## 🛠 Tech Stack
 
-- **Frontend:** Next.js (App Router), React, TypeScript, Tailwind CSS, Server-Sent Events (SSE).
-- **Backend API:** Node.js, Express, PostgreSQL (`pg`), AWS SDK v3 (`@aws-sdk/client-s3`), JWT, bcrypt.
-- **Task Queue & Telemetry:** Redis, BullMQ.
-- **Background Worker:** Standalone Node.js process, Sharp (image processing), pdf-lib (PDF document processing), fluent-ffmpeg (video transcoding & thumbnail extraction).
-- **Object Storage:** MinIO (local development) / Cloudflare R2 or AWS S3 (production).
+- **Frontend:** Next.js 14 (App Router), React, TypeScript, Tailwind CSS, Heroicons, Server-Sent Events (SSE).
+- **Backend API:** Node.js, Express, PostgreSQL (`pg`), Redis (`ioredis`), BullMQ, AWS SDK v3 (`@aws-sdk/client-s3`), JWT, bcrypt, Google Generative AI (`@google/genai`).
+- **Task Queues & Telemetry:** Redis Cloud, BullMQ.
+- **Background Worker:** Standalone Node.js process, Sharp (image resizing/PNG conversion), pdf-lib (PDF metadata & compression), fluent-ffmpeg (video 720p transcoding & thumbnail extraction).
+- **Orchestration Layer:** MCPx Coordinator (`@mcpxx/sdk`) with WebMCP browser tool discovery and 4 reference microservices (`routing-app`, `database-app`, `compute-app`, `frontend-app`).
+- **Storage:** MinIO / AWS S3 / Cloudflare R2.
+- **Cloud Infrastructure:** Supabase PostgreSQL, Redis Cloud, Render (Backend API & Worker), Vercel (Frontends & MCPx Control Plane).
 
 ---
 
 ## ⚙️ Environment Variables
 
 ### Backend (`Backend/.env`)
-| Variable | Description | Example (Local) |
-|---|---|---|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:password@localhost:5433/filepipeline` |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
-| `S3_ENDPOINT` | S3-compatible storage endpoint | `http://localhost:9000` |
-| `S3_REGION` | Storage region | `us-east-1` |
-| `S3_ACCESS_KEY` | Storage access key ID | `minio` |
-| `S3_SECRET_KEY` | Storage secret access key | `minio123` |
-| `S3_BUCKET` | Storage bucket name | `filepipeline` |
-| `JWT_SECRET` | Secret key for JWT signing | `super_secret_jwt_key_change_me` |
-| `ADMIN_EMAILS` | Admin email allowlist | `admin@example.com` |
-| `PORT` | API server port (optional) | `4000` |
 
-### Worker (`worker/.env`)
-| Variable | Description | Example (Local) |
-|---|---|---|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://postgres:password@localhost:5433/filepipeline` |
-| `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
-| `S3_ENDPOINT` | S3-compatible storage endpoint | `http://localhost:9000` |
-| `S3_REGION` | Storage region | `us-east-1` |
-| `S3_ACCESS_KEY` | Storage access key ID | `minio` |
-| `S3_SECRET_KEY` | Storage secret access key | `minio123` |
-| `S3_BUCKET` | Storage bucket name | `filepipeline` |
-| `JWT_SECRET` | Secret key for auth verification | `super_secret_jwt_key_change_me` |
-| `ADMIN_EMAILS` | Admin email allowlist | `admin@example.com` |
+| Variable         | Description                                 | Production Value                                                   |
+| ---------------- | ------------------------------------------- | ------------------------------------------------------------------ |
+| `DATABASE_URL`   | Supabase PostgreSQL connection string       | `postgresql://postgres...pooler.supabase.com:5432/postgres`        |
+| `REDIS_URL`      | Redis Cloud connection URL                  | `redis://default:...@steel-uplifting-sack-43648.db.redis.io:16292` |
+| `JWT_SECRET`     | Secret key for JWT signing                  | Set securely                                                       |
+| `ADMIN_EMAILS`   | Admin email allowlist                       | `davidonadokun@gmail.com`                                          |
+| `MCPX_BASE_URL`  | MCPx Coordinator URL                        | `https://mcpx-mcpx-web.vercel.app`                                 |
+| `LLM_PROVIDER`   | AI Agent LLM provider (`gemini` / `openai`) | `gemini`                                                           |
+| `GEMINI_API_KEY` | Gemini API Key for Agent reasoning          | Set securely                                                       |
+| `GEMINI_MODEL`   | Gemini Model ID                             | `gemini-2.0-flash`                                                 |
 
 ### Frontend (`frontend/.env.local`)
-| Variable | Description | Example (Local) |
-|---|---|---|
-| `NEXT_PUBLIC_API_URL` | Backend API base URL | `http://localhost:4000` |
+
+| Variable                       | Description             | Production Value                             |
+| ------------------------------ | ----------------------- | -------------------------------------------- |
+| `NEXT_PUBLIC_API_URL`          | Backend API base URL    | `https://fileflow-prod-backend.onrender.com` |
+| `NEXT_PUBLIC_MCPX_CONSOLE_URL` | MCPx Coordinator UI URL | `https://mcpx-mcpx-web.vercel.app`           |
 
 ---
 
-## 🚀 Getting Started
+## 🚀 Running Locally
 
-Follow these steps to run the complete environment locally:
-
-### 1. Boot up Infrastructure (PostgreSQL, Redis, MinIO)
 ```bash
+# 1. Start Infrastructure (Postgres, Redis, MinIO)
 docker-compose up -d
+
+# 2. Start Backend API
+cd Backend && npm install && node init-db.js && npm run dev
+
+# 3. Start Worker
+cd worker && npm install && npm run dev
+
+# 4. Start Frontend
+cd frontend && npm install && npm run dev -- -p 3005
+
+# 5. Start MCPx Coordinator (Optional for multi-service operations)
+cd /path/to/mcpx && pnpm dev
 ```
 
-### 2. Start the Backend API (Terminal 1)
+### 🧪 Simulation Testing & Self-Healing Demo
+
+Inject simulated states using the built-in simulation script:
+
 ```bash
 cd Backend
-npm install
-node init-db.js  # Initializes database tables
-npm run dev
+node scripts/seed-simulation.js dlq       # Seeds a transient DLQ failure to watch the agent heal it
+node scripts/seed-simulation.js offline   # Simulates worker going offline
+node scripts/seed-simulation.js reset     # Cleans queues and resets heartbeat
 ```
-
-### 3. Start the Background Worker (Terminal 2)
-```bash
-cd worker
-npm install
-npm run dev
-```
-
-### 4. Start the Frontend Application (Terminal 3)
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### 🎬 How to test
-1. Open **[http://localhost:3000](http://localhost:3000)** and register an account.
-2. On the `/upload` page, upload an image, PDF, or video to see the live SSE status stream.
-3. Click the **Simulate Heavy Load** button to inject multiple concurrent files through the pipeline simultaneously.
-4. View processed files and download them on the `/uploads` (My Files) page.
-
