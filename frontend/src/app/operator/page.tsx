@@ -316,19 +316,19 @@ export default function OperatorPage() {
               const exists = prev.nodes.some((n) => n.id === node.id);
               const updatedNodes: NodeState[] = exists
                 ? prev.nodes.map((n) =>
-                    n.id === node.id
-                      ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
-                      : n
-                  )
+                  n.id === node.id
+                    ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
+                    : n
+                )
                 : [
-                    ...prev.nodes,
-                    {
-                      id: node.id,
-                      fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
-                      state: node.state as NodeState["state"],
-                      error: node.error || null,
-                    },
-                  ];
+                  ...prev.nodes,
+                  {
+                    id: node.id,
+                    fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
+                    state: node.state as NodeState["state"],
+                    error: node.error || null,
+                  },
+                ];
 
               return {
                 ...prev,
@@ -407,7 +407,7 @@ export default function OperatorPage() {
       <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md px-6 py-4 sticky top-0 z-30">
         <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-gradient-to-tr from-indigo-600 via-purple-600 to-cyan-400 p-0.5 shadow-lg shadow-indigo-500/20">
+            <div className="w-10 h-10 rounded-xl bg-linear-to-tr from-indigo-600 via-purple-600 to-cyan-400 p-0.5 shadow-lg shadow-indigo-500/20">
               <div className="w-full h-full bg-slate-950 rounded-[10px] flex items-center justify-center">
                 <SparklesIcon className="w-5 h-5 text-indigo-400" />
               </div>
@@ -565,7 +565,7 @@ export default function OperatorPage() {
               <ClockIcon className="w-4 h-4 text-indigo-400" />
               Agent Activity Sequence
             </h2>
-            <div className="space-y-2.5 overflow-y-auto max-h-[320px] pr-1 flex-1">
+            <div className="space-y-2.5 overflow-y-auto max-h-80 pr-1 flex-1">
               {activityLog.length === 0 ? (
                 <p className="text-xs text-slate-400 italic">No agent actions recorded yet.</p>
               ) : (
@@ -573,17 +573,16 @@ export default function OperatorPage() {
                   <div key={act.id} className="text-xs border-l-2 pl-3 py-1 border-slate-700">
                     <div className="flex items-center gap-2 mb-0.5">
                       <span
-                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded uppercase ${
-                          act.type === "OBSERVED"
+                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded uppercase ${act.type === "OBSERVED"
                             ? "bg-slate-800 text-slate-300"
                             : act.type === "DECIDED"
-                            ? "bg-indigo-950 text-indigo-300 border border-indigo-800/40"
-                            : act.type === "ACTED"
-                            ? "bg-emerald-950 text-emerald-300 border border-emerald-800/40"
-                            : act.type === "VERIFIED"
-                            ? "bg-cyan-950 text-cyan-300 border border-cyan-800/40"
-                            : "bg-rose-950 text-rose-300"
-                        }`}
+                              ? "bg-indigo-950 text-indigo-300 border border-indigo-800/40"
+                              : act.type === "ACTED"
+                                ? "bg-emerald-950 text-emerald-300 border border-emerald-800/40"
+                                : act.type === "VERIFIED"
+                                  ? "bg-cyan-950 text-cyan-300 border border-cyan-800/40"
+                                  : "bg-rose-950 text-rose-300"
+                          }`}
                       >
                         {act.type}
                       </span>
@@ -611,15 +610,14 @@ export default function OperatorPage() {
               </h2>
               {decision && (
                 <span
-                  className={`text-xs px-2.5 py-0.5 rounded-full font-semibold border ${
-                    decision.status === "AUTONOMOUS_ACTION"
+                  className={`text-xs px-2.5 py-0.5 rounded-full font-semibold border ${decision.status === "AUTONOMOUS_ACTION"
                       ? "bg-emerald-950/60 border-emerald-700/50 text-emerald-300"
                       : decision.status === "APPROVAL_REQUIRED"
-                      ? "bg-amber-950/60 border-amber-700/50 text-amber-300"
-                      : decision.status === "BLOCKED"
-                      ? "bg-rose-950/60 border-rose-700/50 text-rose-300"
-                      : "bg-slate-800 border-slate-700 text-slate-300"
-                  }`}
+                        ? "bg-amber-950/60 border-amber-700/50 text-amber-300"
+                        : decision.status === "BLOCKED"
+                          ? "bg-rose-950/60 border-rose-700/50 text-rose-300"
+                          : "bg-slate-800 border-slate-700 text-slate-300"
+                    }`}
                 >
                   {decision.status}
                 </span>
@@ -645,7 +643,7 @@ export default function OperatorPage() {
 
           {/* Proposal Confirmation Card (when APPROVAL_REQUIRED) */}
           {workspaceProposal && (
-            <div className="bg-gradient-to-b from-indigo-950/60 to-slate-900 border-2 border-indigo-600/50 rounded-xl p-5 shadow-xl shadow-indigo-950/50 animate-in fade-in zoom-in-95 duration-200">
+            <div className="bg-linear-to-b from-indigo-950/60 to-slate-900 border-2 border-indigo-600/50 rounded-xl p-5 shadow-xl shadow-indigo-950/50 animate-in fade-in zoom-in-95 duration-200">
               <div className="flex items-center gap-2.5 mb-3 text-indigo-300">
                 <CubeTransparentIcon className="w-5 h-5 text-indigo-400" />
                 <h3 className="text-sm font-bold text-white">Proposal: Provision Processing Workspace</h3>
@@ -737,19 +735,18 @@ export default function OperatorPage() {
                         <span className="text-[10px] text-slate-400 font-mono">({node.id})</span>
                       </div>
                       <span
-                        className={`text-[11px] font-semibold px-2 py-0.5 rounded ${
-                          node.state === "SUCCEEDED"
+                        className={`text-[11px] font-semibold px-2 py-0.5 rounded ${node.state === "SUCCEEDED"
                             ? "bg-emerald-950 text-emerald-300 border border-emerald-800/50"
                             : node.state === "RECOVERED"
-                            ? "bg-teal-950 text-teal-300 border border-teal-800/50"
-                            : node.state === "IN_DOUBT"
-                            ? "bg-amber-950 text-amber-300 border border-amber-800/50 animate-pulse"
-                            : node.state === "FAILED"
-                            ? "bg-rose-950 text-rose-300 border border-rose-800/50"
-                            : node.state === "COMPENSATED"
-                            ? "bg-purple-950 text-purple-300 border border-purple-800/50"
-                            : "bg-slate-800 text-slate-400"
-                        }`}
+                              ? "bg-teal-950 text-teal-300 border border-teal-800/50"
+                              : node.state === "IN_DOUBT"
+                                ? "bg-amber-950 text-amber-300 border border-amber-800/50 animate-pulse"
+                                : node.state === "FAILED"
+                                  ? "bg-rose-950 text-rose-300 border border-rose-800/50"
+                                  : node.state === "COMPENSATED"
+                                    ? "bg-purple-950 text-purple-300 border border-purple-800/50"
+                                    : "bg-slate-800 text-slate-400"
+                          }`}
                       >
                         {node.state}
                       </span>
