@@ -1009,7 +1009,7 @@ app.get("/workspaces/:id", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT * FROM workspaces WHERE id = $1 OR name = $1 OR transaction_id = $1`,
+      `SELECT * FROM workspaces WHERE id::text = $1 OR name = $1 OR transaction_id = $1`,
       [id]
     );
 
@@ -1071,7 +1071,7 @@ app.get("/workspaces/:id/events", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      `SELECT * FROM workspaces WHERE id::text = $1 OR transaction_id = $1`,
       [id]
     );
 
@@ -1139,7 +1139,7 @@ app.post("/workspaces/:id/approve-rollback", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      `SELECT * FROM workspaces WHERE id::text = $1 OR transaction_id = $1`,
       [id]
     );
 
@@ -1178,7 +1178,7 @@ app.post("/workspaces/:id/reject-rollback", async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT * FROM workspaces WHERE id = $1 OR transaction_id = $1`,
+      `SELECT * FROM workspaces WHERE id::text = $1 OR transaction_id = $1`,
       [id]
     );
 
