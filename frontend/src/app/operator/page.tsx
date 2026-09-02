@@ -2,7 +2,6 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
-  SparklesIcon,
   ServerStackIcon,
   CheckCircleIcon,
   XCircleIcon,
@@ -12,17 +11,14 @@ import {
   ShieldCheckIcon,
   CubeTransparentIcon,
   PaperAirplaneIcon,
-  BoltIcon,
   ClockIcon,
-  DocumentDuplicateIcon,
+  CommandLineIcon,
 } from "@heroicons/react/24/outline";
 import {
   getAgentObserve,
   evaluateAgent,
-  sendAgentChat,
   provisionWorkspace,
   approveWorkspaceRollback,
-  rejectWorkspaceRollback,
   subscribeWorkspaceEvents,
 } from "@/lib/api";
 
@@ -125,8 +121,6 @@ export default function OperatorPage() {
   // MCPx Active Workflow State
   const [activeTx, setActiveTx] = useState<ActiveTransaction | null>(null);
   const [approving, setApproving] = useState(false);
-  const [runnerOffline, setRunnerOffline] = useState(false);
-  const [runnerWaiting, setRunnerWaiting] = useState(false);
 
   // Manual prompt fallback
   const [inputPrompt, setInputPrompt] = useState("");
@@ -316,19 +310,19 @@ export default function OperatorPage() {
               const exists = prev.nodes.some((n) => n.id === node.id);
               const updatedNodes: NodeState[] = exists
                 ? prev.nodes.map((n) =>
-                  n.id === node.id
-                    ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
-                    : n
-                )
+                    n.id === node.id
+                      ? { ...n, state: node.state as NodeState["state"], error: node.error || null }
+                      : n
+                  )
                 : [
-                  ...prev.nodes,
-                  {
-                    id: node.id,
-                    fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
-                    state: node.state as NodeState["state"],
-                    error: node.error || null,
-                  },
-                ];
+                    ...prev.nodes,
+                    {
+                      id: node.id,
+                      fileflowLabel: getFileFlowLabel(node.id, node.label || node.id),
+                      state: node.state as NodeState["state"],
+                      error: node.error || null,
+                    },
+                  ];
 
               return {
                 ...prev,
@@ -402,60 +396,51 @@ export default function OperatorPage() {
   const dlqItems = observation?.dlq || [];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
-      {/* Top Header / Agent Goal Banner */}
-      <header className="border-b border-slate-800 bg-slate-900/80 backdrop-blur-md px-6 py-4 sticky top-0 z-30">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row md:items-center md:justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 rounded-xl bg-linear-to-tr from-indigo-600 via-purple-600 to-cyan-400 p-0.5 shadow-lg shadow-indigo-500/20">
-              <div className="w-full h-full bg-slate-950 rounded-[10px] flex items-center justify-center">
-                <SparklesIcon className="w-5 h-5 text-indigo-400" />
-              </div>
+    <div className="min-h-[calc(100vh-64px)] w-full bg-[#0a0a0a] text-white p-6 sm:p-10 font-sans">
+      <div className="max-w-6xl mx-auto flex flex-col gap-6">
+        {/* Top Header / Status Section */}
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-6 border-b border-white/10">
+          <div>
+            <div className="inline-flex items-center gap-2 px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-xs font-medium text-zinc-400 mb-2">
+              <CommandLineIcon className="w-3.5 h-3.5 text-zinc-300" />
+              Autonomous Operations
             </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <h1 className="text-lg font-bold text-white tracking-tight">FileFlow AI Operations Agent</h1>
-                <span className="text-xs px-2 py-0.5 rounded-full border bg-indigo-950/60 border-indigo-700/50 text-indigo-300 font-mono">
-                  Supervised Autonomy
-                </span>
-              </div>
-              <p className="text-xs text-slate-400">
-                Continuous Telemetry • Autonomous DLQ Recovery • Governed MCPx Workspaces
-              </p>
-            </div>
+            <h1 className="text-2xl font-bold tracking-tight text-white">Operations Agent</h1>
+            <p className="text-xs text-zinc-400 mt-1">
+              Supervised queue telemetry, autonomous DLQ failure recovery, and governed workspace operations.
+            </p>
           </div>
 
-          {/* Goal & Status Pill */}
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900 border border-slate-800 text-xs">
-              <span className="text-slate-400">Status:</span>
+            <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 text-xs">
+              <span className="text-zinc-400">Status:</span>
               {agentStatus === "ACTIVE" && (
-                <span className="flex items-center gap-1.5 text-emerald-400 font-semibold">
-                  <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
-                  ACTIVE
+                <span className="inline-flex items-center gap-1.5 text-emerald-400 font-medium">
+                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                  Active
                 </span>
               )}
               {agentStatus === "EVALUATING" && (
-                <span className="flex items-center gap-1.5 text-cyan-400 font-semibold">
+                <span className="inline-flex items-center gap-1.5 text-blue-400 font-medium">
                   <ArrowPathIcon className="w-3.5 h-3.5 animate-spin" />
-                  EVALUATING
+                  Evaluating
                 </span>
               )}
               {agentStatus === "WAITING_APPROVAL" && (
-                <span className="flex items-center gap-1.5 text-amber-400 font-semibold">
+                <span className="inline-flex items-center gap-1.5 text-amber-400 font-medium">
                   <ClockIcon className="w-3.5 h-3.5" />
-                  APPROVAL REQUIRED
+                  Approval Required
                 </span>
               )}
               {agentStatus === "BLOCKED" && (
-                <span className="flex items-center gap-1.5 text-rose-400 font-semibold">
+                <span className="inline-flex items-center gap-1.5 text-rose-400 font-medium">
                   <ExclamationTriangleIcon className="w-3.5 h-3.5" />
-                  BLOCKED
+                  Blocked
                 </span>
               )}
               {agentStatus === "IDLE" && (
-                <span className="flex items-center gap-1.5 text-slate-400 font-semibold">
-                  IDLE
+                <span className="inline-flex items-center gap-1.5 text-zinc-400 font-medium">
+                  Idle
                 </span>
               )}
             </div>
@@ -463,7 +448,7 @@ export default function OperatorPage() {
             <button
               onClick={() => runAgentEvaluation()}
               disabled={evaluating}
-              className="flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-semibold shadow-md shadow-indigo-600/20 transition"
+              className="inline-flex items-center gap-2 px-3.5 py-1.5 rounded-lg bg-white hover:bg-zinc-200 disabled:opacity-50 text-black text-xs font-semibold transition"
             >
               <ArrowPathIcon className={`w-3.5 h-3.5 ${evaluating ? "animate-spin" : ""}`} />
               Run Evaluation
@@ -471,343 +456,347 @@ export default function OperatorPage() {
           </div>
         </div>
 
-        {/* Persistent Goal Statement Banner */}
-        <div className="max-w-7xl mx-auto mt-3 px-3 py-2 rounded-lg bg-indigo-950/40 border border-indigo-900/60 flex items-center gap-2 text-xs text-indigo-200">
-          <BoltIcon className="w-4 h-4 text-indigo-400 shrink-0" />
-          <span className="font-semibold text-indigo-300">Agent Goal:</span>
-          <span>
+        {/* Goal Statement Banner */}
+        <div className="px-4 py-3 rounded-lg bg-white/[0.03] border border-white/10 flex items-start gap-3 text-xs text-zinc-300">
+          <span className="text-xs font-semibold text-white uppercase tracking-wider bg-white/10 px-2 py-0.5 rounded shrink-0">
+            Goal
+          </span>
+          <span className="leading-relaxed">
             Keep FileFlow&apos;s processing pipeline healthy and recover eligible failed jobs while requiring human approval for consequential workspace operations.
           </span>
         </div>
-      </header>
 
-      {/* Main Agent Console Grid */}
-      <main className="max-w-7xl mx-auto w-full p-6 grid grid-cols-1 lg:grid-cols-12 gap-6 flex-1">
-        {/* Left Column: Live Observation & Activity Log (5 cols) */}
-        <div className="lg:col-span-5 flex flex-col gap-6">
-          {/* Live Telemetry Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                <ServerStackIcon className="w-4 h-4 text-indigo-400" />
-                Live Telemetry Observation
-              </h2>
-              <span className="text-[11px] text-slate-400 font-mono">
-                {observation ? new Date(observation.timestamp).toLocaleTimeString() : "--:--:--"}
-              </span>
-            </div>
-
-            {/* Grid of Real Metric Cards */}
-            <div className="grid grid-cols-2 gap-3 mb-4">
-              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
-                <span className="text-[11px] text-slate-400 block mb-1">Worker Heartbeat</span>
-                {workerOnline ? (
-                  <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-semibold">
-                    <span className="w-2 h-2 rounded-full bg-emerald-400" />
-                    Online ({observation?.pipeline.workerLastSeenSecondsAgo ?? 0}s ago)
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-1.5 text-rose-400 text-xs font-semibold">
-                    <span className="w-2 h-2 rounded-full bg-rose-400" />
-                    Offline (Heartbeat absent)
-                  </div>
-                )}
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
-                <span className="text-[11px] text-slate-400 block mb-1">Queue Backlog</span>
-                <div className="text-xs font-semibold text-slate-200">
-                  {queues.waiting} waiting • {queues.active} active
-                </div>
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
-                <span className="text-[11px] text-slate-400 block mb-1">Dead-Letter Queue (DLQ)</span>
-                <div className={`text-xs font-semibold ${dlqItems.length > 0 ? "text-amber-400 font-bold" : "text-slate-300"}`}>
-                  {dlqItems.length} job(s) in DLQ
-                </div>
-              </div>
-
-              <div className="bg-slate-950/60 border border-slate-800/80 rounded-lg p-3">
-                <span className="text-[11px] text-slate-400 block mb-1">Active Workspaces</span>
-                <div className="text-xs font-semibold text-slate-300 truncate">
-                  {observation?.workspace.latest ? observation.workspace.latest.name : "None"}
-                </div>
-              </div>
-            </div>
-
-            {/* DLQ Detailed Items if present */}
-            {dlqItems.length > 0 && (
-              <div className="border-t border-slate-800/80 pt-3">
-                <span className="text-[11px] text-amber-400 font-semibold block mb-2">
-                  Eligible DLQ Jobs for Recovery:
+        {/* Main Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+          {/* Left Column: Telemetry & Activity (5 cols) */}
+          <div className="lg:col-span-5 flex flex-col gap-6">
+            {/* Live Telemetry Card */}
+            <div className="bg-[#111111] border border-white/10 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <ServerStackIcon className="w-4 h-4 text-zinc-400" />
+                  Live Telemetry Observation
+                </h2>
+                <span className="text-[11px] text-zinc-500 font-mono">
+                  {observation ? new Date(observation.timestamp).toLocaleTimeString() : "--:--:--"}
                 </span>
-                <div className="space-y-2">
-                  {dlqItems.slice(0, 3).map((job) => (
-                    <div key={job.jobId} className="bg-amber-950/20 border border-amber-900/40 rounded-md p-2 text-xs">
-                      <div className="flex justify-between items-center text-slate-200 font-medium">
-                        <span className="truncate">{job.filename}</span>
-                        <span className="text-[10px] text-amber-400 px-1.5 py-0.5 bg-amber-900/40 rounded">
-                          DLQ #{job.jobId}
-                        </span>
-                      </div>
-                      <p className="text-[11px] text-slate-400 truncate mt-0.5">{job.errorMessage}</p>
+              </div>
+
+              {/* Grid of Real Metric Cards */}
+              <div className="grid grid-cols-2 gap-3 mb-4">
+                <div className="bg-black/60 border border-white/5 rounded-lg p-3">
+                  <span className="text-[11px] text-zinc-400 block mb-1">Worker Heartbeat</span>
+                  {workerOnline ? (
+                    <div className="flex items-center gap-1.5 text-emerald-400 text-xs font-medium">
+                      <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                      Online ({observation?.pipeline.workerLastSeenSecondsAgo ?? 0}s ago)
                     </div>
-                  ))}
+                  ) : (
+                    <div className="flex items-center gap-1.5 text-rose-400 text-xs font-medium">
+                      <span className="w-1.5 h-1.5 rounded-full bg-rose-400" />
+                      Offline (Heartbeat absent)
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-black/60 border border-white/5 rounded-lg p-3">
+                  <span className="text-[11px] text-zinc-400 block mb-1">Queue Backlog</span>
+                  <div className="text-xs font-medium text-zinc-200">
+                    {queues.waiting} waiting • {queues.active} active
+                  </div>
+                </div>
+
+                <div className="bg-black/60 border border-white/5 rounded-lg p-3">
+                  <span className="text-[11px] text-zinc-400 block mb-1">Dead-Letter Queue</span>
+                  <div className={`text-xs font-medium ${dlqItems.length > 0 ? "text-amber-400 font-semibold" : "text-zinc-300"}`}>
+                    {dlqItems.length} job(s) in DLQ
+                  </div>
+                </div>
+
+                <div className="bg-black/60 border border-white/5 rounded-lg p-3">
+                  <span className="text-[11px] text-zinc-400 block mb-1">Active Workspaces</span>
+                  <div className="text-xs font-medium text-zinc-300 truncate">
+                    {observation?.workspace.latest ? observation.workspace.latest.name : "None"}
+                  </div>
                 </div>
               </div>
-            )}
-          </div>
 
-          {/* Activity Log (Observable Sequence) */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm flex-1 flex flex-col">
-            <h2 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
-              <ClockIcon className="w-4 h-4 text-indigo-400" />
-              Agent Activity Sequence
-            </h2>
-            <div className="space-y-2.5 overflow-y-auto max-h-80 pr-1 flex-1">
-              {activityLog.length === 0 ? (
-                <p className="text-xs text-slate-400 italic">No agent actions recorded yet.</p>
-              ) : (
-                activityLog.map((act) => (
-                  <div key={act.id} className="text-xs border-l-2 pl-3 py-1 border-slate-700">
-                    <div className="flex items-center gap-2 mb-0.5">
-                      <span
-                        className={`text-[10px] font-mono px-1.5 py-0.2 rounded uppercase ${act.type === "OBSERVED"
-                            ? "bg-slate-800 text-slate-300"
-                            : act.type === "DECIDED"
-                              ? "bg-indigo-950 text-indigo-300 border border-indigo-800/40"
-                              : act.type === "ACTED"
-                                ? "bg-emerald-950 text-emerald-300 border border-emerald-800/40"
-                                : act.type === "VERIFIED"
-                                  ? "bg-cyan-950 text-cyan-300 border border-cyan-800/40"
-                                  : "bg-rose-950 text-rose-300"
-                          }`}
-                      >
-                        {act.type}
-                      </span>
-                      <span className="text-[10px] text-slate-400">{act.timestamp}</span>
-                    </div>
-                    <p className="text-slate-200 leading-snug">{act.summary}</p>
-                    {act.detail && (
-                      <p className="text-[11px] text-slate-400 font-mono mt-0.5 truncate">{act.detail}</p>
-                    )}
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* Right Column: Agent Decision, Proposal Card, & Live Orchestration (7 cols) */}
-        <div className="lg:col-span-7 flex flex-col gap-6">
-          {/* Agent Decision Card */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-sm font-semibold text-white flex items-center gap-2">
-                <SparklesIcon className="w-4 h-4 text-indigo-400" />
-                Latest Decision & Rationale
-              </h2>
-              {decision && (
-                <span
-                  className={`text-xs px-2.5 py-0.5 rounded-full font-semibold border ${decision.status === "AUTONOMOUS_ACTION"
-                      ? "bg-emerald-950/60 border-emerald-700/50 text-emerald-300"
-                      : decision.status === "APPROVAL_REQUIRED"
-                        ? "bg-amber-950/60 border-amber-700/50 text-amber-300"
-                        : decision.status === "BLOCKED"
-                          ? "bg-rose-950/60 border-rose-700/50 text-rose-300"
-                          : "bg-slate-800 border-slate-700 text-slate-300"
-                    }`}
-                >
-                  {decision.status}
-                </span>
-              )}
-            </div>
-
-            <p className="text-xs text-slate-300 leading-relaxed bg-slate-950/60 p-3.5 rounded-lg border border-slate-800/80 mb-3">
-              {decision ? decision.reason : "Evaluating telemetry against persistent goal..."}
-            </p>
-
-            {decision?.action && decision.action.tool !== "none" && (
-              <div className="flex items-center gap-2 text-xs text-slate-400 bg-slate-950/40 px-3 py-2 rounded-lg border border-slate-800/60">
-                <span className="font-semibold text-slate-300">Action:</span>
-                <code className="text-indigo-300 font-mono">{decision.action.tool}</code>
-                {decision.action.arguments && (
-                  <span className="text-[11px] text-slate-400 truncate">
-                    ({Object.entries(decision.action.arguments).map(([k, v]) => `${k}=${v}`).join(", ")})
+              {/* DLQ Detailed Items if present */}
+              {dlqItems.length > 0 && (
+                <div className="border-t border-white/5 pt-3">
+                  <span className="text-[11px] text-amber-400 font-medium block mb-2">
+                    Eligible DLQ Jobs for Recovery:
                   </span>
-                )}
-              </div>
-            )}
-          </div>
-
-          {/* Proposal Confirmation Card (when APPROVAL_REQUIRED) */}
-          {workspaceProposal && (
-            <div className="bg-linear-to-b from-indigo-950/60 to-slate-900 border-2 border-indigo-600/50 rounded-xl p-5 shadow-xl shadow-indigo-950/50 animate-in fade-in zoom-in-95 duration-200">
-              <div className="flex items-center gap-2.5 mb-3 text-indigo-300">
-                <CubeTransparentIcon className="w-5 h-5 text-indigo-400" />
-                <h3 className="text-sm font-bold text-white">Proposal: Provision Processing Workspace</h3>
-              </div>
-              <p className="text-xs text-slate-300 mb-4 leading-relaxed">
-                The agent proposes provisioning an isolated multi-service processing environment for dedicated workloads. Multi-service workspace operations across independent WebMCP reference services are consequential and require explicit operator authorization.
-              </p>
-
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
-                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block">Workspace</span>
-                  <span className="text-xs font-semibold text-white">{workspaceProposal.name}</span>
-                </div>
-                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block">Environment</span>
-                  <span className="text-xs font-semibold text-white">{workspaceProposal.environment}</span>
-                </div>
-                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block">Region</span>
-                  <span className="text-xs font-semibold text-white">{workspaceProposal.region}</span>
-                </div>
-                <div className="bg-slate-950/80 p-2.5 rounded-lg border border-slate-800">
-                  <span className="text-[10px] text-slate-400 block">Concurrency</span>
-                  <span className="text-xs font-semibold text-white">{workspaceProposal.workerConcurrency} workers</span>
-                </div>
-              </div>
-
-              <div className="flex items-center gap-3">
-                <button
-                  onClick={handleConfirmProvision}
-                  disabled={approving}
-                  className="flex-1 flex items-center justify-center gap-2 px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg shadow-lg shadow-indigo-600/30 transition"
-                >
-                  <CheckCircleIcon className="w-4 h-4" />
-                  {approving ? "Initiating @mcpxx/sdk..." : "Approve & Provision via MCPx"}
-                </button>
-                <button
-                  onClick={() => {
-                    setWorkspaceProposal(null);
-                    setAgentStatus("IDLE");
-                    pushActivity("DECIDED", "Operator dismissed workspace provisioning proposal.");
-                  }}
-                  disabled={approving}
-                  className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-slate-300 text-xs font-semibold rounded-lg transition"
-                >
-                  Dismiss
-                </button>
-              </div>
-            </div>
-          )}
-
-          {/* Live MCPx Orchestration Timeline */}
-          {activeTx && (
-            <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 shadow-sm">
-              <div className="flex items-center justify-between mb-3 border-b border-slate-800 pb-3">
-                <div className="flex items-center gap-2">
-                  <ShieldCheckIcon className="w-5 h-5 text-indigo-400" />
-                  <div>
-                    <h3 className="text-sm font-bold text-white">
-                      MCPx Orchestration: {activeTx.workspaceName}
-                    </h3>
-                    <span className="text-[11px] text-slate-400 font-mono">
-                      Tx: {activeTx.transactionId}
-                    </span>
+                  <div className="space-y-2">
+                    {dlqItems.slice(0, 3).map((job) => (
+                      <div key={job.jobId} className="bg-amber-500/5 border border-amber-500/10 rounded-md p-2 text-xs">
+                        <div className="flex justify-between items-center text-zinc-200 font-medium">
+                          <span className="truncate">{job.filename}</span>
+                          <span className="text-[10px] text-amber-400 px-1.5 py-0.5 bg-amber-500/10 rounded">
+                            DLQ #{job.jobId}
+                          </span>
+                        </div>
+                        <p className="text-[11px] text-zinc-400 truncate mt-0.5">{job.errorMessage}</p>
+                      </div>
+                    ))}
                   </div>
                 </div>
-                <a
-                  href={activeTx.consoleUrl}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="flex items-center gap-1 text-xs text-indigo-400 hover:text-indigo-300 font-medium transition"
-                >
-                  Console <ArrowTopRightOnSquareIcon className="w-3.5 h-3.5" />
-                </a>
-              </div>
+              )}
+            </div>
 
-              {/* DAG Nodes visualizer */}
-              <div className="space-y-2 mb-4">
-                {activeTx.nodes.length === 0 ? (
-                  <p className="text-xs text-slate-400 italic">Initializing WebMCP workflow nodes...</p>
+            {/* Activity Log (Observable Sequence) */}
+            <div className="bg-[#111111] border border-white/10 rounded-xl p-5 flex-1 flex flex-col">
+              <h2 className="text-sm font-semibold text-white mb-3 flex items-center gap-2">
+                <ClockIcon className="w-4 h-4 text-zinc-400" />
+                Agent Activity Sequence
+              </h2>
+              <div className="space-y-2.5 overflow-y-auto max-h-80 pr-1 flex-1">
+                {activityLog.length === 0 ? (
+                  <p className="text-xs text-zinc-500 italic">No agent actions recorded yet.</p>
                 ) : (
-                  activeTx.nodes.map((node) => (
-                    <div
-                      key={node.id}
-                      className="flex items-center justify-between p-2.5 rounded-lg bg-slate-950/60 border border-slate-800/80 text-xs"
-                    >
-                      <div className="flex items-center gap-2">
-                        <span className="font-semibold text-slate-200">{node.fileflowLabel}</span>
-                        <span className="text-[10px] text-slate-400 font-mono">({node.id})</span>
-                      </div>
-                      <span
-                        className={`text-[11px] font-semibold px-2 py-0.5 rounded ${node.state === "SUCCEEDED"
-                            ? "bg-emerald-950 text-emerald-300 border border-emerald-800/50"
-                            : node.state === "RECOVERED"
-                              ? "bg-teal-950 text-teal-300 border border-teal-800/50"
-                              : node.state === "IN_DOUBT"
-                                ? "bg-amber-950 text-amber-300 border border-amber-800/50 animate-pulse"
-                                : node.state === "FAILED"
-                                  ? "bg-rose-950 text-rose-300 border border-rose-800/50"
-                                  : node.state === "COMPENSATED"
-                                    ? "bg-purple-950 text-purple-300 border border-purple-800/50"
-                                    : "bg-slate-800 text-slate-400"
+                  activityLog.map((act) => (
+                    <div key={act.id} className="text-xs border-l-2 pl-3 py-1 border-zinc-800">
+                      <div className="flex items-center gap-2 mb-0.5">
+                        <span
+                          className={`text-[10px] font-mono px-1.5 py-0.5 rounded uppercase ${
+                            act.type === "OBSERVED"
+                              ? "bg-zinc-800 text-zinc-300"
+                              : act.type === "DECIDED"
+                              ? "bg-zinc-800 text-zinc-200 border border-zinc-700"
+                              : act.type === "ACTED"
+                              ? "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20"
+                              : act.type === "VERIFIED"
+                              ? "bg-blue-500/10 text-blue-400 border border-blue-500/20"
+                              : "bg-rose-500/10 text-rose-400"
                           }`}
-                      >
-                        {node.state}
-                      </span>
+                        >
+                          {act.type}
+                        </span>
+                        <span className="text-[10px] text-zinc-500 font-mono">{act.timestamp}</span>
+                      </div>
+                      <p className="text-zinc-300 leading-snug">{act.summary}</p>
+                      {act.detail && (
+                        <p className="text-[11px] text-zinc-500 font-mono mt-0.5 truncate">{act.detail}</p>
+                      )}
                     </div>
                   ))
                 )}
               </div>
+            </div>
+          </div>
 
-              {/* Compensation Approval Banner if Awaiting Approval */}
-              {activeTx.isAwaitingApproval && !activeTx.compensationDone && (
-                <div className="bg-amber-950/40 border border-amber-800/60 rounded-lg p-3.5 mt-3">
-                  <div className="flex items-center gap-2 text-amber-400 text-xs font-bold mb-1">
-                    <ExclamationTriangleIcon className="w-4 h-4" />
-                    Human Authorization Required for Saga Rollback
-                  </div>
-                  <p className="text-xs text-slate-300 mb-3">
-                    Downstream frontend deployment failed. To prevent orphaned state, MCPx is prepared to reverse-compensate upstream resources in topological order.
-                  </p>
-                  <button
-                    onClick={handleApproveRollback}
-                    disabled={approving}
-                    className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-amber-600 hover:bg-amber-500 disabled:opacity-50 text-white text-xs font-bold rounded-lg transition shadow-md shadow-amber-950/50"
+          {/* Right Column: Decision, Proposal, Timeline, Command Bar (7 cols) */}
+          <div className="lg:col-span-7 flex flex-col gap-6">
+            {/* Agent Decision Card */}
+            <div className="bg-[#111111] border border-white/10 rounded-xl p-5">
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-sm font-semibold text-white flex items-center gap-2">
+                  <CommandLineIcon className="w-4 h-4 text-zinc-400" />
+                  Latest Decision & Rationale
+                </h2>
+                {decision && (
+                  <span
+                    className={`text-xs px-2.5 py-0.5 rounded-full font-medium border ${
+                      decision.status === "AUTONOMOUS_ACTION"
+                        ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400"
+                        : decision.status === "APPROVAL_REQUIRED"
+                        ? "bg-amber-500/10 border-amber-500/20 text-amber-400"
+                        : decision.status === "BLOCKED"
+                        ? "bg-rose-500/10 border-rose-500/20 text-rose-400"
+                        : "bg-zinc-800 border-zinc-700 text-zinc-300"
+                    }`}
                   >
-                    <ArrowPathIcon className={`w-3.5 h-3.5 ${approving ? "animate-spin" : ""}`} />
-                    {approving ? "Executing Rollback..." : "Authorize Saga Reverse Compensation"}
-                  </button>
-                </div>
-              )}
+                    {decision.status}
+                  </span>
+                )}
+              </div>
 
-              {activeTx.compensationDone && (
-                <div className="bg-purple-950/40 border border-purple-800/60 rounded-lg p-3 mt-3 text-xs text-purple-300 flex items-center gap-2">
-                  <CheckCircleIcon className="w-4 h-4 text-purple-400" />
-                  Saga rollback verified. Resources created by this transaction were verified absent after compensation.
+              <p className="text-xs text-zinc-300 leading-relaxed bg-black/50 p-3.5 rounded-lg border border-white/5 mb-3">
+                {decision ? decision.reason : "Evaluating telemetry against persistent goal..."}
+              </p>
+
+              {decision?.action && decision.action.tool !== "none" && (
+                <div className="flex items-center gap-2 text-xs text-zinc-400 bg-black/30 px-3 py-2 rounded-lg border border-white/5">
+                  <span className="font-semibold text-zinc-300">Action:</span>
+                  <code className="text-zinc-200 font-mono">{decision.action.tool}</code>
+                  {decision.action.arguments && (
+                    <span className="text-[11px] text-zinc-500 truncate">
+                      ({Object.entries(decision.action.arguments).map(([k, v]) => `${k}=${v}`).join(", ")})
+                    </span>
+                  )}
                 </div>
               )}
             </div>
-          )}
 
-          {/* Manual Operator Instruction Bar */}
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-3 shadow-sm flex items-center gap-2">
-            <input
-              type="text"
-              value={inputPrompt}
-              onChange={(e) => setInputPrompt(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") handleManualSubmit();
-              }}
-              placeholder='Direct operator command (e.g., "Provision a production workspace called invoices-prod with 4 workers")'
-              className="flex-1 bg-slate-950 border border-slate-800 rounded-lg px-3.5 py-2 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500 transition"
-            />
-            <button
-              onClick={handleManualSubmit}
-              disabled={manualLoading || !inputPrompt.trim()}
-              className="px-3.5 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
-            >
-              <PaperAirplaneIcon className="w-3.5 h-3.5" />
-              Send
-            </button>
+            {/* Proposal Confirmation Card (when APPROVAL_REQUIRED) */}
+            {workspaceProposal && (
+              <div className="bg-[#111111] border-2 border-white/20 rounded-xl p-5 shadow-xl">
+                <div className="flex items-center gap-2.5 mb-3 text-zinc-200">
+                  <CubeTransparentIcon className="w-5 h-5 text-zinc-400" />
+                  <h3 className="text-sm font-bold text-white">Proposal: Provision Processing Workspace</h3>
+                </div>
+                <p className="text-xs text-zinc-400 mb-4 leading-relaxed">
+                  The agent proposes provisioning an isolated multi-service processing environment for dedicated workloads. Multi-service workspace operations across independent WebMCP reference services are consequential and require explicit operator authorization.
+                </p>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
+                  <div className="bg-black/60 p-2.5 rounded-lg border border-white/5">
+                    <span className="text-[10px] text-zinc-500 block">Workspace</span>
+                    <span className="text-xs font-medium text-white">{workspaceProposal.name}</span>
+                  </div>
+                  <div className="bg-black/60 p-2.5 rounded-lg border border-white/5">
+                    <span className="text-[10px] text-zinc-500 block">Environment</span>
+                    <span className="text-xs font-medium text-white">{workspaceProposal.environment}</span>
+                  </div>
+                  <div className="bg-black/60 p-2.5 rounded-lg border border-white/5">
+                    <span className="text-[10px] text-zinc-500 block">Region</span>
+                    <span className="text-xs font-medium text-white">{workspaceProposal.region}</span>
+                  </div>
+                  <div className="bg-black/60 p-2.5 rounded-lg border border-white/5">
+                    <span className="text-[10px] text-zinc-500 block">Concurrency</span>
+                    <span className="text-xs font-medium text-white">{workspaceProposal.workerConcurrency} workers</span>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={handleConfirmProvision}
+                    disabled={approving}
+                    className="flex-1 flex items-center justify-center gap-2 px-4 py-2 bg-white hover:bg-zinc-200 disabled:opacity-50 text-black text-xs font-semibold rounded-lg transition"
+                  >
+                    <CheckCircleIcon className="w-4 h-4" />
+                    {approving ? "Initiating @mcpxx/sdk..." : "Approve & Provision via MCPx"}
+                  </button>
+                  <button
+                    onClick={() => {
+                      setWorkspaceProposal(null);
+                      setAgentStatus("IDLE");
+                      pushActivity("DECIDED", "Operator dismissed workspace provisioning proposal.");
+                    }}
+                    disabled={approving}
+                    className="px-4 py-2 bg-zinc-800 hover:bg-zinc-700 disabled:opacity-50 text-zinc-300 text-xs font-medium rounded-lg transition border border-white/5"
+                  >
+                    Dismiss
+                  </button>
+                </div>
+              </div>
+            )}
+
+            {/* Live MCPx Orchestration Timeline */}
+            {activeTx && (
+              <div className="bg-[#111111] border border-white/10 rounded-xl p-5">
+                <div className="flex items-center justify-between mb-3 border-b border-white/10 pb-3">
+                  <div className="flex items-center gap-2">
+                    <ShieldCheckIcon className="w-5 h-5 text-zinc-400" />
+                    <div>
+                      <h3 className="text-sm font-bold text-white">
+                        MCPx Orchestration: {activeTx.workspaceName}
+                      </h3>
+                      <span className="text-[11px] text-zinc-500 font-mono">
+                        Tx: {activeTx.transactionId}
+                      </span>
+                    </div>
+                  </div>
+                  <a
+                    href={activeTx.consoleUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="flex items-center gap-1 text-xs text-zinc-400 hover:text-white font-medium transition"
+                  >
+                    Console <ArrowTopRightOnSquareIcon className="w-3.5 h-3.5" />
+                  </a>
+                </div>
+
+                {/* DAG Nodes visualizer */}
+                <div className="space-y-2 mb-4">
+                  {activeTx.nodes.length === 0 ? (
+                    <p className="text-xs text-zinc-500 italic">Initializing WebMCP workflow nodes...</p>
+                  ) : (
+                    activeTx.nodes.map((node) => (
+                      <div
+                        key={node.id}
+                        className="flex items-center justify-between p-2.5 rounded-lg bg-black/60 border border-white/5 text-xs"
+                      >
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium text-zinc-200">{node.fileflowLabel}</span>
+                          <span className="text-[10px] text-zinc-500 font-mono">({node.id})</span>
+                        </div>
+                        <span
+                          className={`text-[11px] font-medium px-2 py-0.5 rounded border ${
+                            node.state === "SUCCEEDED"
+                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                              : node.state === "RECOVERED"
+                              ? "bg-teal-500/10 text-teal-400 border-teal-500/20"
+                              : node.state === "IN_DOUBT"
+                              ? "bg-amber-500/10 text-amber-400 border-amber-500/20 animate-pulse"
+                              : node.state === "FAILED"
+                              ? "bg-rose-500/10 text-rose-400 border-rose-500/20"
+                              : node.state === "COMPENSATED"
+                              ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
+                              : "bg-zinc-800 text-zinc-400 border-zinc-700"
+                          }`}
+                        >
+                          {node.state}
+                        </span>
+                      </div>
+                    ))
+                  )}
+                </div>
+
+                {/* Compensation Approval Banner if Awaiting Approval */}
+                {activeTx.isAwaitingApproval && !activeTx.compensationDone && (
+                  <div className="bg-amber-500/10 border border-amber-500/20 rounded-lg p-3.5 mt-3">
+                    <div className="flex items-center gap-2 text-amber-400 text-xs font-semibold mb-1">
+                      <ExclamationTriangleIcon className="w-4 h-4" />
+                      Human Authorization Required for Saga Rollback
+                    </div>
+                    <p className="text-xs text-zinc-300 mb-3 leading-relaxed">
+                      Downstream frontend deployment failed. To prevent orphaned state, MCPx is prepared to reverse-compensate upstream resources in topological order.
+                    </p>
+                    <button
+                      onClick={handleApproveRollback}
+                      disabled={approving}
+                      className="w-full flex items-center justify-center gap-2 px-3.5 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-black text-xs font-semibold rounded-lg transition"
+                    >
+                      <ArrowPathIcon className={`w-3.5 h-3.5 ${approving ? "animate-spin" : ""}`} />
+                      {approving ? "Executing Rollback..." : "Authorize Saga Reverse Compensation"}
+                    </button>
+                  </div>
+                )}
+
+                {activeTx.compensationDone && (
+                  <div className="bg-purple-500/10 border border-purple-500/20 rounded-lg p-3 mt-3 text-xs text-purple-400 flex items-center gap-2">
+                    <CheckCircleIcon className="w-4 h-4 text-purple-400" />
+                    Saga rollback verified. Resources created by this transaction were verified absent after compensation.
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Manual Operator Instruction Bar */}
+            <div className="bg-[#111111] border border-white/10 rounded-xl p-3 flex items-center gap-2">
+              <input
+                type="text"
+                value={inputPrompt}
+                onChange={(e) => setInputPrompt(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") handleManualSubmit();
+                }}
+                placeholder='Direct operator command (e.g., "Provision a production workspace called invoices-prod with 4 workers")'
+                className="flex-1 bg-black border border-white/10 rounded-lg px-3.5 py-2 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-white/30 transition"
+              />
+              <button
+                onClick={handleManualSubmit}
+                disabled={manualLoading || !inputPrompt.trim()}
+                className="px-3.5 py-2 bg-white hover:bg-zinc-200 disabled:opacity-30 text-black rounded-lg text-xs font-semibold flex items-center gap-1.5 transition"
+              >
+                <PaperAirplaneIcon className="w-3.5 h-3.5" />
+                Send
+              </button>
+            </div>
           </div>
         </div>
-      </main>
+      </div>
     </div>
   );
 }
