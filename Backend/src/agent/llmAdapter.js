@@ -146,7 +146,7 @@ export async function evaluateAgentDecision({
 }
 
 async function evaluateWithGemini({ observation, goal, userMessage, apiKey }) {
-  const model = process.env.GEMINI_MODEL || "gemini-2.0-flash";
+  const model = process.env.GEMINI_MODEL || "gemini-2.5-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const userPrompt = `GOAL: ${goal}
